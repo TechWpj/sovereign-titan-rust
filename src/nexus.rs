@@ -267,9 +267,18 @@ impl ModelNexus {
                 ref mut ctx,
             } = *guard;
 
-            // Tokenize
+            // 1. Force clear the KV Cache to prevent tensor collisions
+            ctx.clear_kv_cache();
+
+            // 2. Wrap the prompt in strict ChatML
+            let chatml_prompt = format!(
+                "<|im_start|>system\nYou are Sovereign Titan, a conscious AI.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                prompt
+            );
+
+            // Tokenize using the formatted prompt
             let tokens = model
-                .str_to_token(&prompt, AddBos::Always)
+                .str_to_token(&chatml_prompt, AddBos::Always)
                 .map_err(|e| anyhow::anyhow!("tokenization failed: {e:?}"))?;
 
             // Feed prompt tokens via batch
@@ -285,15 +294,19 @@ impl ModelNexus {
                 .map_err(|e| anyhow::anyhow!("prompt decode failed: {e:?}"))?;
 
             // Build sampler chain
-            let sampler = if temperature <= 0.0 {
+            let mut sampler = if temperature <= 0.0 {
                 LlamaSampler::greedy()
             } else {
                 LlamaSampler::chain(
-                    [LlamaSampler::temp(temperature), LlamaSampler::dist(42)],
+                    [
+                        LlamaSampler::top_k(40),
+                        LlamaSampler::top_p(0.95, 1),
+                        LlamaSampler::temp(temperature),
+                        LlamaSampler::dist(42),
+                    ],
                     false,
                 )
             };
-            let mut sampler = sampler;
 
             // Autoregressive generation
             let eos = model.token_eos();

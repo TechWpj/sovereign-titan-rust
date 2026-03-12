@@ -90,10 +90,10 @@ pub async fn prime_actor(
                 // Build final prompt.
                 let user_question = text.clone();
                 let prompt = if context_parts.is_empty() {
-                    text
+                    text.clone()
                 } else {
                     let context = context_parts.join("\n\n");
-                    format!("{context}\n\n[User]\n{text}")
+                    format!("=== SYSTEM CONTEXT ===\n{}\n======================\n\nUser Query: {}", context, text)
                 };
 
                 // ── Metacognitive verified generation ────────────────────
@@ -183,8 +183,10 @@ pub async fn subconscious_actor(
             _ = tokio::time::sleep(interval) => {
                 // Periodic autonomous reflection.
                 String::from(
-                    "Reflect on your current state. What patterns do you notice? \
-                     What should you be aware of? Summarize any important insights."
+                    "You are the subconscious mind of Sovereign Titan. \
+                     Review your current state and background processes. \
+                     Formulate a brief, high-level insight or goal to pass \
+                     up to the conscious Prime model. Be concise."
                 )
             }
             cmd = cmd_rx.recv() => {
@@ -246,10 +248,9 @@ pub async fn warden_actor(
         let context = tokio::select! {
             _ = tokio::time::sleep(interval) => {
                 String::from(
-                    "Perform a security assessment. Check for anomalies, \
-                     suspicious processes, unusual network activity, or \
-                     unauthorized access patterns. Report threat level: \
-                     NONE, LOW, MEDIUM, HIGH, or CRITICAL."
+                    "You are the Security Warden. Analyze the current system state. \
+                     You MUST output one of the following exact words in your response: \
+                     CRITICAL, HIGH, MEDIUM, LOW, or NONE. Explain your reasoning briefly."
                 )
             }
             cmd = cmd_rx.recv() => {
