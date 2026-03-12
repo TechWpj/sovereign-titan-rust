@@ -18,6 +18,16 @@ async-trait = "0.1"
 walkdir = "2"
 regex = "1"
 tauri = { version = "2", features = [] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+petgraph = "0.6"
+uuid = { version = "1.8", features = ["v4", "fast-rng"] }
+aes-gcm = "0.10"
+rand = "0.8"
+enigo = "0.2.1"
+headless_chrome = "1.0"
+pdf-extract = "0.7"
+sysinfo = "0.30"
+pnet = "0.34"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

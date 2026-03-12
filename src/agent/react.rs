@@ -11,9 +11,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use regex::Regex;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::nexus::{ModelNexus, ModelTarget};
+use crate::security::policy::{PolicyDecision, PolicyManager};
 use crate::tools::ToolRegistry;
 
 /// Maximum number of ReAct steps before forcing a final answer.
@@ -39,20 +41,22 @@ pub enum ReActStep {
 pub struct ReActAgent {
     nexus: Arc<ModelNexus>,
     registry: ToolRegistry,
+    policy: Arc<Mutex<PolicyManager>>,
     system_prompt: String,
     max_tokens: u32,
     temperature: f32,
 }
 
 impl ReActAgent {
-    /// Create a new ReAct agent.
-    pub fn new(nexus: Arc<ModelNexus>, registry: ToolRegistry) -> Self {
+    /// Create a new ReAct agent with a policy manager for ABAC enforcement.
+    pub fn new(nexus: Arc<ModelNexus>, registry: ToolRegistry, policy: Arc<Mutex<PolicyManager>>) -> Self {
         let tool_block = registry.describe_all();
         let system_prompt = Self::build_system_prompt(&tool_block);
 
         Self {
             nexus,
             registry,
+            policy,
             system_prompt,
             max_tokens: 1024,
             temperature: 0.7,
@@ -72,6 +76,9 @@ impl ReActAgent {
              - Use **file_search** to find files by name across Desktop, Documents, OneDrive.\n\
              - Use **shell** to run any system command (dir, echo, pip, git, etc.).\n\
              - Use **system_control** to launch programs, kill processes, manage services, or lock/sleep.\n\
+             - Use **computer_control** to move the mouse, click, type text, or press keys for UI automation.\n\
+             - Use **web_search** to fetch a web page by URL and extract its text content.\n\
+             - Use **code_ops** to read, create, or append to local files on the host machine.\n\
              \n\
              For each step, you MUST respond in EXACTLY this format:\n\
              \n\
@@ -158,20 +165,34 @@ impl ReActAgent {
                     info!("ReAct thought: {thought}");
                     info!("ReAct action: {action}({action_input})");
 
-                    // Look up the tool.
-                    let observation = if let Some(tool) = self.registry.get(&action) {
-                        // Parse the action input as JSON.
-                        let input: serde_json::Value =
-                            serde_json::from_str(&action_input).unwrap_or_else(|_| {
-                                serde_json::json!({"query": action_input})
-                            });
+                    // ── Policy gate — check permission before execution ──
+                    let policy_decision = {
+                        let mut pm = self.policy.lock().await;
+                        pm.check_permission(&action, &action_input)
+                    };
 
-                        match tool.execute(input).await {
-                            Ok(result) => result,
-                            Err(e) => format!("Tool error: {e}"),
+                    let observation = match policy_decision {
+                        PolicyDecision::Deny { reason } => {
+                            warn!("ReAct: tool '{action}' BLOCKED by policy: {reason}");
+                            format!("POLICY DENIED: {reason}")
                         }
-                    } else {
-                        format!("Unknown tool: \"{action}\". Available tools: {:?}", self.registry.names())
+                        PolicyDecision::Allow => {
+                            // Look up the tool.
+                            if let Some(tool) = self.registry.get(&action) {
+                                // Parse the action input as JSON.
+                                let input: serde_json::Value =
+                                    serde_json::from_str(&action_input).unwrap_or_else(|_| {
+                                        serde_json::json!({"query": action_input})
+                                    });
+
+                                match tool.execute(input).await {
+                                    Ok(result) => result,
+                                    Err(e) => format!("Tool error: {e}"),
+                                }
+                            } else {
+                                format!("Unknown tool: \"{action}\". Available tools: {:?}", self.registry.names())
+                            }
+                        }
                     };
 
                     // Append the step to history.

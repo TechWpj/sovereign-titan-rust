@@ -5,9 +5,12 @@
 //! which allows lookup by name and produces description blocks for prompt
 //! injection.
 
+pub mod code;
+pub mod computer_use;
 pub mod file_search;
 pub mod shell;
 pub mod system_control;
+pub mod web;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -84,5 +87,8 @@ pub fn default_registry() -> ToolRegistry {
     registry.register(Arc::new(file_search::FileSearchTool));
     registry.register(Arc::new(shell::ShellTool));
     registry.register(Arc::new(system_control::SystemControlTool));
+    registry.register(Arc::new(computer_use::ComputerControlTool));
+    registry.register(Arc::new(web::WebSearchTool));
+    registry.register(Arc::new(code::CodeOpsTool));
     registry
 }

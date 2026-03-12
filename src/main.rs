@@ -2,9 +2,14 @@
 
 mod actors;
 mod agent;
+mod cognitive;
 mod config;
+mod knowledge;
+mod memory;
 mod messages;
 mod nexus;
+mod routing;
+mod security;
 mod tools;
 mod warden;
 
@@ -18,6 +23,8 @@ use tracing::{info, warn};
 
 use crate::actors::{prime_actor, subconscious_actor, warden_actor};
 use crate::config::TitanConfig;
+use crate::knowledge::graph::KnowledgeGraph;
+use crate::memory::ledger::Ledger;
 use crate::messages::{CognitiveMessage, SubconsciousCommand, WardenCommand};
 use crate::nexus::ModelNexus;
 
@@ -107,8 +114,32 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let (sub_cmd_tx, sub_cmd_rx) = mpsc::channel::<SubconsciousCommand>(16);
     let (warden_cmd_tx, warden_cmd_rx) = mpsc::channel::<WardenCommand>(16);
 
+    // ── Memory & Knowledge ─────────────────────────────────────────────────
+    let ledger = Arc::new(
+        Ledger::new(Some("workspace/ledger.enc"), Some("workspace/.ledger_key"))
+            .unwrap_or_else(|e| {
+                warn!("Ledger init failed, using default: {e}");
+                Ledger::new(None, None).expect("default ledger must succeed")
+            }),
+    );
+
+    let knowledge = Arc::new(tokio::sync::Mutex::new(
+        KnowledgeGraph::new(Some("workspace/knowledge.json"))
+            .unwrap_or_else(|e| {
+                warn!("KnowledgeGraph init failed, using empty: {e}");
+                KnowledgeGraph::new(None).expect("empty graph must succeed")
+            }),
+    ));
+
+    info!("Memory systems initialized (ledger + knowledge graph)");
+
     // ── Spawn Actors ───────────────────────────────────────────────────────
-    tauri::async_runtime::spawn(prime_actor(Arc::clone(&nexus), prime_rx));
+    tauri::async_runtime::spawn(prime_actor(
+        Arc::clone(&nexus),
+        prime_rx,
+        Arc::clone(&ledger),
+        Arc::clone(&knowledge),
+    ));
 
     let mut keep_sub_tx: Option<mpsc::Sender<SubconsciousCommand>> = None;
     let mut keep_warden_tx: Option<mpsc::Sender<WardenCommand>> = None;

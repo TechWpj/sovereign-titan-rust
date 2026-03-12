@@ -6,9 +6,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
+use crate::cognitive::metacognition;
+use crate::cognitive::working_memory::WorkingMemory;
+use crate::knowledge::graph::KnowledgeGraph;
+use crate::memory::ledger::Ledger;
 use crate::messages::{CognitiveMessage, SubconsciousCommand, WardenCommand};
 use crate::nexus::{ModelNexus, ModelTarget};
 
@@ -22,28 +26,89 @@ use crate::nexus::{ModelNexus, ModelTarget};
 /// - `UserChat`: generates a response via the Nexus and replies.
 /// - `SecurityAlert`: interrupts current work to address the threat.
 /// - `SubconsciousInsight`: stores insights for context enrichment.
-pub async fn prime_actor(nexus: Arc<ModelNexus>, mut rx: mpsc::Receiver<CognitiveMessage>) {
-    info!("Prime actor started");
+pub async fn prime_actor(
+    nexus: Arc<ModelNexus>,
+    mut rx: mpsc::Receiver<CognitiveMessage>,
+    ledger: Arc<Ledger>,
+    knowledge: Arc<Mutex<KnowledgeGraph>>,
+) {
+    info!("Prime actor started (with memory + knowledge + working memory)");
 
     // Rolling buffer of subconscious insights for context enrichment.
     let mut insights: Vec<String> = Vec::new();
     const MAX_INSIGHTS: usize = 10;
+
+    // Working memory for cross-turn context continuity.
+    let mut working_memory = WorkingMemory::with_defaults();
 
     while let Some(msg) = rx.recv().await {
         match msg {
             CognitiveMessage::UserChat { text, reply } => {
                 info!("Prime: received user chat ({} chars)", text.len());
 
-                // Build prompt with any available subconscious context.
-                let prompt = if insights.is_empty() {
+                // ── Store user message in working memory ────────────────
+                working_memory.add(&text, "user", 0.8);
+
+                // ── Load memory context ──────────────────────────────────
+                let mut context_parts: Vec<String> = Vec::new();
+
+                // Working memory block (highest salience items).
+                let wm_block = working_memory.get_prompt_block();
+                if !wm_block.is_empty() {
+                    context_parts.push(wm_block);
+                }
+
+                // Ledger summary (goals, preferences, status).
+                let ledger_summary = ledger.get_summary();
+                if !ledger_summary.is_empty() {
+                    context_parts.push(format!("[Memory]\n{ledger_summary}"));
+                }
+
+                // Knowledge graph context — extract entity names from the query
+                // and look up adjacent knowledge.
+                {
+                    let kg = knowledge.lock().await;
+                    for word in text.split_whitespace() {
+                        let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
+                        if clean.len() >= 3 {
+                            if kg.find_entity(clean).is_some() {
+                                let kg_ctx = kg.get_context(clean);
+                                context_parts.push(format!("[Knowledge: {clean}]\n{kg_ctx}"));
+                            }
+                        }
+                    }
+                }
+
+                // Subconscious insights.
+                if !insights.is_empty() {
+                    context_parts.push(format!(
+                        "[Background awareness]\n{}",
+                        insights.join("\n")
+                    ));
+                }
+
+                // Build final prompt.
+                let user_question = text.clone();
+                let prompt = if context_parts.is_empty() {
                     text
                 } else {
-                    let context = insights.join("\n");
-                    format!("[Background awareness]\n{context}\n\n[User]\n{text}")
+                    let context = context_parts.join("\n\n");
+                    format!("{context}\n\n[User]\n{text}")
                 };
 
-                match nexus.generate(&prompt, ModelTarget::Prime, 512, 0.7).await {
+                // ── Metacognitive verified generation ────────────────────
+                match metacognition::verified_generate(
+                    &nexus,
+                    &prompt,
+                    &user_question,
+                    512,
+                    0.7,
+                )
+                .await
+                {
                     Ok(response) => {
+                        // Store the response in working memory for continuity.
+                        working_memory.add(&response, "assistant", 0.6);
                         let _ = reply.send(response);
                     }
                     Err(e) => {
