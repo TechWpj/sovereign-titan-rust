@@ -6,6 +6,8 @@
 //! injection.
 
 pub mod file_search;
+pub mod shell;
+pub mod system_control;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,4 +76,13 @@ impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Build a [`ToolRegistry`] pre-loaded with all available tools.
+pub fn default_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(file_search::FileSearchTool));
+    registry.register(Arc::new(shell::ShellTool));
+    registry.register(Arc::new(system_control::SystemControlTool));
+    registry
 }

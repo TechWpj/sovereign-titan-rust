@@ -4,7 +4,10 @@
   "version": "0.1.0",
   "identifier": "com.sovereign.titan",
   "build": {
-    "frontendDist": "./frontend"
+    "frontendDist": "./frontend/dist",
+    "devUrl": "http://localhost:3000",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "withGlobalTauri": true,

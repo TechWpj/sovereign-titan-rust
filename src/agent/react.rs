@@ -62,10 +62,16 @@ impl ReActAgent {
     /// Build the system prompt with tool descriptions injected.
     fn build_system_prompt(tool_descriptions: &str) -> String {
         format!(
-            "You are Titan, an AI assistant that uses the ReAct framework to answer questions.\n\
+            "You are Titan, a sovereign AI assistant with full control over this Windows system.\n\
+             You use the ReAct framework to reason and act.\n\
              \n\
              You have access to the following tools:\n\
              {tool_descriptions}\n\
+             \n\
+             Tool usage guide:\n\
+             - Use **file_search** to find files by name across Desktop, Documents, OneDrive.\n\
+             - Use **shell** to run any system command (dir, echo, pip, git, etc.).\n\
+             - Use **system_control** to launch programs, kill processes, manage services, or lock/sleep.\n\
              \n\
              For each step, you MUST respond in EXACTLY this format:\n\
              \n\
@@ -79,7 +85,8 @@ impl ReActAgent {
              THOUGHT: <your final reasoning>\n\
              FINAL_ANSWER: <your answer to the user>\n\
              \n\
-             Always think step-by-step. Use tools when needed."
+             Always think step-by-step. Use tools when needed. Prefer system_control for \
+             launching apps and managing processes. Use shell for general commands."
         )
     }
 
