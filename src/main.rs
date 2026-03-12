@@ -11,6 +11,7 @@ mod messages;
 mod nexus;
 mod routing;
 mod security;
+mod system;
 mod tools;
 mod warden;
 mod workflows;
@@ -27,6 +28,7 @@ use crate::actors::{prime_actor, subconscious_actor, warden_actor};
 use crate::config::TitanConfig;
 use crate::messages::{CognitiveMessage, SubconsciousCommand, WardenCommand};
 use crate::nexus::ModelNexus;
+use crate::system::app_discovery::AppDiscovery;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared application state for Tauri IPC commands
@@ -157,13 +159,23 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         tool_registry.names()
     );
 
+    // ── App Discovery ────────────────────────────────────────────────────
+    let app_discovery = Arc::new(std::sync::Mutex::new(AppDiscovery::new()));
+    {
+        let mut disc = app_discovery.lock().unwrap();
+        disc.scan();
+        info!("AppDiscovery: {} apps cached", disc.app_count());
+    }
+
     // ── Spawn Actors ───────────────────────────────────────────────────────
     let prime_handle = handle.clone();
+    let prime_discovery = Arc::clone(&app_discovery);
     tauri::async_runtime::spawn(prime_actor(
         Arc::clone(&nexus),
         prime_rx,
         tool_registry,
         Some(prime_handle),
+        Some(prime_discovery),
     ));
 
     let mut keep_sub_tx: Option<mpsc::Sender<SubconsciousCommand>> = None;

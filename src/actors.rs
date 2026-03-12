@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 use crate::agent::react::ReActAgent;
 use crate::messages::{CognitiveMessage, SubconsciousCommand, WardenCommand};
 use crate::nexus::{ModelNexus, ModelTarget};
+use crate::system::app_discovery::AppDiscovery;
 use crate::tools::ToolRegistry;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -52,14 +53,18 @@ pub async fn prime_actor(
     mut rx: mpsc::Receiver<CognitiveMessage>,
     tool_registry: ToolRegistry,
     app_handle: Option<AppHandle>,
+    app_discovery: Option<Arc<std::sync::Mutex<AppDiscovery>>>,
 ) {
     info!("Prime actor started (ReAct-enabled)");
 
-    // Build the ReAct agent with tools and optional Tauri handle.
+    // Build the ReAct agent with tools, optional Tauri handle, and AppDiscovery.
     let agent = {
         let mut a = ReActAgent::new(Arc::clone(&nexus), tool_registry);
         if let Some(ref handle) = app_handle {
             a = a.with_app_handle(handle.clone());
+        }
+        if let Some(discovery) = app_discovery {
+            a = a.with_app_discovery(discovery);
         }
         a
     };

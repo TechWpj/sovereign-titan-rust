@@ -6,15 +6,27 @@
 //! injection.
 
 pub mod api_search;
+pub mod audio_control;
+pub mod calculator;
+pub mod clipboard;
+pub mod clock;
 pub mod code;
 pub mod computer_use;
+pub mod document_create;
 pub mod file_search;
 pub mod media;
+pub mod network_tools;
 pub mod os_browser;
+pub mod process_manager;
 pub mod rag;
+pub mod screen_capture;
 pub mod shell;
+pub mod software_control;
 pub mod system_control;
+pub mod system_map;
+pub mod text_transform;
 pub mod web;
+pub mod window_control;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -88,6 +100,8 @@ impl Default for ToolRegistry {
 /// Build a [`ToolRegistry`] pre-loaded with all available tools.
 pub fn default_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
+
+    // ── Original 10 tools ────────────────────────────────────────────────
     registry.register(Arc::new(file_search::FileSearchTool));
     registry.register(Arc::new(shell::ShellTool));
     registry.register(Arc::new(system_control::SystemControlTool));
@@ -98,5 +112,22 @@ pub fn default_registry() -> ToolRegistry {
     registry.register(Arc::new(api_search::ApiSearchTool::new()));
     registry.register(Arc::new(media::MediaTool));
     registry.register(Arc::new(rag::RagTool::new()));
+
+    // ── Wave 2: 10 new tools ─────────────────────────────────────────────
+    registry.register(Arc::new(window_control::WindowControlTool));
+    registry.register(Arc::new(clipboard::ClipboardTool));
+    registry.register(Arc::new(audio_control::AudioControlTool));
+    registry.register(Arc::new(clock::ClockTool));
+    registry.register(Arc::new(calculator::CalculatorTool));
+    registry.register(Arc::new(screen_capture::ScreenCaptureTool));
+    registry.register(Arc::new(system_map::SystemMapTool));
+    registry.register(Arc::new(process_manager::ProcessManagerTool));
+    registry.register(Arc::new(text_transform::TextTransformTool));
+    registry.register(Arc::new(network_tools::NetworkToolsTool));
+
+    // ── Wave 4: 2 new tools ──────────────────────────────────────────────
+    registry.register(Arc::new(software_control::SoftwareControlTool));
+    registry.register(Arc::new(document_create::DocumentCreateTool));
+
     registry
 }

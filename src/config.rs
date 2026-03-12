@@ -96,6 +96,14 @@ pub struct TitanConfig {
     pub quantum_enabled: bool,
     pub voice_enabled: bool,
 
+    // ── Wave 4 feature flags ──────────────────────────────────────────
+    pub app_discovery_enabled: bool,
+    pub execution_paths_enabled: bool,
+    pub observation_distiller_enabled: bool,
+    pub tool_memory_enabled: bool,
+    pub fast_paths_enabled: bool,
+    pub verbosity_mode: String,
+
     // ── Server ───────────────────────────────────────────────────────────
     pub api_host: String,
     pub api_port: u16,
@@ -171,6 +179,14 @@ impl TitanConfig {
             vlm_enabled: env_bool("TITAN_VLM_ENABLED", true),
             quantum_enabled: env_bool("TITAN_QUANTUM_ENABLED", true),
             voice_enabled: env_bool("TITAN_VOICE_ENABLED", true),
+
+            // ── Wave 4 feature flags ────────────────────────────────────
+            app_discovery_enabled: env_bool("TITAN_APP_DISCOVERY_ENABLED", true),
+            execution_paths_enabled: env_bool("TITAN_EXECUTION_PATHS_ENABLED", true),
+            observation_distiller_enabled: env_bool("TITAN_OBSERVATION_DISTILLER_ENABLED", true),
+            tool_memory_enabled: env_bool("TITAN_TOOL_MEMORY_ENABLED", true),
+            fast_paths_enabled: env_bool("TITAN_FAST_PATHS_ENABLED", true),
+            verbosity_mode: env_or("TITAN_VERBOSITY_MODE", "assistant"),
 
             // ── Server ──────────────────────────────────────────────────
             api_host: env_or("TITAN_API_HOST", "127.0.0.1"),

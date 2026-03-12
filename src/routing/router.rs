@@ -47,6 +47,23 @@ impl SemanticRouter {
                     "command": caps[1].trim()
                 }),
             },
+            // ── URL Navigation (must come BEFORE App Launch to capture "open https://...") ──
+            Route {
+                pattern: Regex::new(r"(?i)^(?:open|go to|navigate to|visit|browse)\s+(https?://\S+)$").unwrap(),
+                tool: "system_control",
+                action: "open_url",
+                extract: |caps| serde_json::json!({
+                    "action": "open_url",
+                    "url": caps[1].trim()
+                }),
+            },
+            // ── Window Management (must come BEFORE List Directory to capture "list windows") ──
+            Route {
+                pattern: Regex::new(r"(?i)^(?:list|show)\s+(?:all\s+)?(?:open\s+)?windows$").unwrap(),
+                tool: "window_control",
+                action: "list",
+                extract: |_| serde_json::json!({"action": "list"}),
+            },
             // ── App Launch ──────────────────────────────────────────────
             Route {
                 pattern: Regex::new(r"(?i)^(?:open|launch|start|run)\s+(.+)$").unwrap(),
@@ -65,15 +82,6 @@ impl SemanticRouter {
                 extract: |caps| serde_json::json!({
                     "action": "kill_process",
                     "name": caps[1].trim()
-                }),
-            },
-            // ── Web Navigation ──────────────────────────────────────────
-            Route {
-                pattern: Regex::new(r"(?i)^(?:go to|navigate to|visit|browse)\s+(https?://\S+)$").unwrap(),
-                tool: "web_search",
-                action: "fetch",
-                extract: |caps| serde_json::json!({
-                    "url": caps[1].trim()
                 }),
             },
             // ── File Read ───────────────────────────────────────────────
@@ -137,6 +145,44 @@ impl SemanticRouter {
                     "action": "click",
                     "x": caps[1].parse::<i64>().unwrap_or(0),
                     "y": caps[2].parse::<i64>().unwrap_or(0)
+                }),
+            },
+            // (URL Navigation with "open" moved to top for correct priority)
+            // ── Volume Control ────────────────────────────────────────────
+            Route {
+                pattern: Regex::new(r"(?i)^(?:set\s+)?volume\s+(?:to\s+)?(\d+)(?:\s*%)?$").unwrap(),
+                tool: "audio_control",
+                action: "set_volume",
+                extract: |caps| serde_json::json!({
+                    "action": "set_volume",
+                    "level": caps[1].parse::<i64>().unwrap_or(50)
+                }),
+            },
+            Route {
+                pattern: Regex::new(r"(?i)^(mute|unmute)(?:\s+(?:the\s+)?(?:volume|audio|sound))?$").unwrap(),
+                tool: "audio_control",
+                action: "toggle_mute",
+                extract: |caps| {
+                    let action = if caps[1].to_lowercase() == "unmute" { "unmute" } else { "mute" };
+                    serde_json::json!({"action": action})
+                },
+            },
+            // (Window Management moved to top of routes for correct priority)
+            // ── Take Screenshot ───────────────────────────────────────────
+            Route {
+                pattern: Regex::new(r"(?i)^(?:take\s+(?:a\s+)?)?screenshot$").unwrap(),
+                tool: "screen_capture",
+                action: "capture",
+                extract: |_| serde_json::json!({"action": "capture"}),
+            },
+            // ── Calculator ────────────────────────────────────────────────
+            Route {
+                pattern: Regex::new(r"(?i)^(?:calculate|calc|compute)\s+(.+)$").unwrap(),
+                tool: "calculator",
+                action: "evaluate",
+                extract: |caps| serde_json::json!({
+                    "action": "evaluate",
+                    "expression": caps[1].trim()
                 }),
             },
         ];
@@ -233,7 +279,8 @@ mod tests {
         let r = router();
         match r.route("go to https://example.com") {
             RouteDecision::DirectTool { tool, args, .. } => {
-                assert_eq!(tool, "web_search");
+                assert_eq!(tool, "system_control");
+                assert_eq!(args["action"], "open_url");
                 assert_eq!(args["url"], "https://example.com");
             }
             _ => panic!("expected DirectTool"),
@@ -316,5 +363,96 @@ mod tests {
             }
             _ => panic!("expected DirectTool"),
         }
+    }
+
+    #[test]
+    fn test_url_navigation() {
+        let r = router();
+        match r.route("open https://youtube.com") {
+            RouteDecision::DirectTool { tool, args, .. } => {
+                assert_eq!(tool, "system_control");
+                assert_eq!(args["action"], "open_url");
+                assert_eq!(args["url"], "https://youtube.com");
+            }
+            _ => panic!("expected DirectTool"),
+        }
+    }
+
+    #[test]
+    fn test_volume_set() {
+        let r = router();
+        match r.route("volume to 50") {
+            RouteDecision::DirectTool { tool, args, .. } => {
+                assert_eq!(tool, "audio_control");
+                assert_eq!(args["level"], 50);
+            }
+            _ => panic!("expected DirectTool"),
+        }
+    }
+
+    #[test]
+    fn test_mute() {
+        let r = router();
+        match r.route("mute") {
+            RouteDecision::DirectTool { tool, args, .. } => {
+                assert_eq!(tool, "audio_control");
+                assert_eq!(args["action"], "mute");
+            }
+            _ => panic!("expected DirectTool"),
+        }
+    }
+
+    #[test]
+    fn test_unmute() {
+        let r = router();
+        match r.route("unmute the volume") {
+            RouteDecision::DirectTool { tool, args, .. } => {
+                assert_eq!(tool, "audio_control");
+                assert_eq!(args["action"], "unmute");
+            }
+            _ => panic!("expected DirectTool"),
+        }
+    }
+
+    #[test]
+    fn test_list_windows() {
+        let r = router();
+        match r.route("list windows") {
+            RouteDecision::DirectTool { tool, args, .. } => {
+                assert_eq!(tool, "window_control");
+                assert_eq!(args["action"], "list");
+            }
+            _ => panic!("expected DirectTool"),
+        }
+    }
+
+    #[test]
+    fn test_screenshot() {
+        let r = router();
+        match r.route("take a screenshot") {
+            RouteDecision::DirectTool { tool, args, .. } => {
+                assert_eq!(tool, "screen_capture");
+                assert_eq!(args["action"], "capture");
+            }
+            _ => panic!("expected DirectTool"),
+        }
+    }
+
+    #[test]
+    fn test_calculator() {
+        let r = router();
+        match r.route("calculate 2 + 2") {
+            RouteDecision::DirectTool { tool, args, .. } => {
+                assert_eq!(tool, "calculator");
+                assert_eq!(args["expression"], "2 + 2");
+            }
+            _ => panic!("expected DirectTool"),
+        }
+    }
+
+    #[test]
+    fn test_route_count_increased() {
+        let r = router();
+        assert!(r.route_count() >= 16, "Expected at least 16 routes, got {}", r.route_count());
     }
 }
