@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sovereign Titan</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: transparent;
+      font-family: 'Segoe UI', -apple-system, sans-serif;
+      color: #e0e0e0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      overflow: hidden;
+    }
+
+    /* ── Alert Toast ──────────────────────────────────────────── */
+    #alert-container {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      z-index: 1000;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .alert-toast {
+      background: rgba(220, 38, 38, 0.85);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 80, 80, 0.4);
+      border-radius: 8px;
+      padding: 12px 16px;
+      max-width: 400px;
+      font-size: 13px;
+      animation: slideIn 0.3s ease-out;
+    }
+
+    .alert-toast .alert-level {
+      font-weight: 700;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 4px;
+      color: #fca5a5;
+    }
+
+    @keyframes slideIn {
+      from { transform: translateX(100%); opacity: 0; }
+      to   { transform: translateX(0);    opacity: 1; }
+    }
+
+    /* ── Status Bar ───────────────────────────────────────────── */
+    #status-bar {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      display: flex;
+      gap: 8px;
+      z-index: 100;
+    }
+
+    .status-dot {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(0, 0, 0, 0.6);
+      backdrop-filter: blur(8px);
+      border-radius: 12px;
+      padding: 4px 10px;
+      font-size: 11px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .status-dot .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+    }
+
+    .dot-online  { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
+    .dot-offline { background: #6b7280; }
+
+    /* ── Chat Panel ───────────────────────────────────────────── */
+    #chat-panel {
+      background: rgba(10, 10, 15, 0.80);
+      backdrop-filter: blur(16px);
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 16px 24px;
+      max-height: 45vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      margin-bottom: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255,255,255,0.15) transparent;
+    }
+
+    .msg {
+      padding: 8px 12px;
+      border-radius: 8px;
+      max-width: 80%;
+      font-size: 14px;
+      line-height: 1.5;
+      word-wrap: break-word;
+    }
+
+    .msg-user {
+      align-self: flex-end;
+      background: rgba(59, 130, 246, 0.3);
+      border: 1px solid rgba(59, 130, 246, 0.25);
+    }
+
+    .msg-titan {
+      align-self: flex-start;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .msg-error {
+      align-self: flex-start;
+      background: rgba(220, 38, 38, 0.2);
+      border: 1px solid rgba(220, 38, 38, 0.2);
+      color: #fca5a5;
+    }
+
+    /* ── Input Area ───────────────────────────────────────────── */
+    #input-area {
+      display: flex;
+      gap: 8px;
+    }
+
+    #user-input {
+      flex: 1;
+      background: rgba(255, 255, 255, 0.07);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: #e0e0e0;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    #user-input:focus {
+      border-color: rgba(59, 130, 246, 0.5);
+    }
+
+    #user-input::placeholder {
+      color: rgba(255, 255, 255, 0.3);
+    }
+
+    #send-btn {
+      background: rgba(59, 130, 246, 0.4);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      border-radius: 8px;
+      padding: 10px 20px;
+      color: #e0e0e0;
+      font-size: 14px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    #send-btn:hover {
+      background: rgba(59, 130, 246, 0.6);
+    }
+
+    #send-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+<body>
+  <!-- Status Bar -->
+  <div id="status-bar"></div>
+
+  <!-- Security Alert Toasts -->
+  <div id="alert-container"></div>
+
+  <!-- Chat Panel -->
+  <div id="chat-panel">
+    <div id="messages"></div>
+    <div id="input-area">
+      <input type="text" id="user-input" placeholder="Ask Titan..." autofocus>
+      <button id="send-btn">Send</button>
+    </div>
+  </div>
+
+  <script>
+    // ── Tauri IPC ──────────────────────────────────────────────
+    const TAURI = window.__TAURI__;
+    const invoke = TAURI ? TAURI.core.invoke : null;
+    const listen = TAURI ? TAURI.event.listen : null;
+
+    const messagesEl = document.getElementById('messages');
+    const inputEl    = document.getElementById('user-input');
+    const sendBtn    = document.getElementById('send-btn');
+    const statusBar  = document.getElementById('status-bar');
+    const alertBox   = document.getElementById('alert-container');
+
+    // ── Chat ───────────────────────────────────────────────────
+    function addMessage(text, type) {
+      const div = document.createElement('div');
+      div.className = 'msg msg-' + type;
+      div.textContent = text;
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    async function sendChat() {
+      const text = inputEl.value.trim();
+      if (!text || !invoke) return;
+
+      addMessage(text, 'user');
+      inputEl.value = '';
+      sendBtn.disabled = true;
+
+      try {
+        const response = await invoke('send_chat', { message: text });
+        addMessage(response, 'titan');
+      } catch (err) {
+        addMessage('Error: ' + err, 'error');
+      } finally {
+        sendBtn.disabled = false;
+        inputEl.focus();
+      }
+    }
+
+    sendBtn.addEventListener('click', sendChat);
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChat();
+      }
+    });
+
+    // ── Status ─────────────────────────────────────────────────
+    async function refreshStatus() {
+      if (!invoke) return;
+      try {
+        const models = await invoke('get_status');
+        statusBar.innerHTML = '';
+        models.forEach((m) => {
+          const dot = document.createElement('div');
+          dot.className = 'status-dot';
+          dot.innerHTML =
+            '<span class="dot ' + (m.loaded ? 'dot-online' : 'dot-offline') + '"></span>' +
+            m.name;
+          statusBar.appendChild(dot);
+        });
+      } catch (e) {
+        console.error('Status fetch failed:', e);
+      }
+    }
+
+    refreshStatus();
+    setInterval(refreshStatus, 15000);
+
+    // ── Security Alerts ────────────────────────────────────────
+    function showAlert(payload) {
+      const toast = document.createElement('div');
+      toast.className = 'alert-toast';
+      toast.innerHTML =
+        '<div class="alert-level">Security Alert</div>' +
+        '<div>' + payload + '</div>';
+      alertBox.appendChild(toast);
+      setTimeout(() => toast.remove(), 10000);
+    }
+
+    if (listen) {
+      listen('security-alert', (event) => {
+        showAlert(event.payload);
+      });
+
+      listen('token-stream', (event) => {
+        // Future: streaming token output
+        console.log('token:', event.payload);
+      });
+    }
+  </script>
+</body>
+</html>
