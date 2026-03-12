@@ -6,15 +6,34 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, Mutex};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter};
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::cognitive::metacognition;
-use crate::cognitive::working_memory::WorkingMemory;
-use crate::knowledge::graph::KnowledgeGraph;
-use crate::memory::ledger::Ledger;
+use crate::agent::react::ReActAgent;
 use crate::messages::{CognitiveMessage, SubconsciousCommand, WardenCommand};
 use crate::nexus::{ModelNexus, ModelTarget};
+use crate::tools::ToolRegistry;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tauri event payloads for actor events
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Emitted when the subconscious produces an insight.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubconsciousEvent {
+    pub insight: String,
+    pub timestamp: u64,
+}
+
+/// Emitted when the warden completes a security scan.
+#[derive(Debug, Clone, Serialize)]
+pub struct WardenEvent {
+    pub threat_level: String,
+    pub details: String,
+    pub timestamp: u64,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Prime Actor (14B GPU)
@@ -22,97 +41,53 @@ use crate::nexus::{ModelNexus, ModelTarget};
 
 /// The Prime actor — main user-facing inference brain.
 ///
-/// Listens on an `mpsc::Receiver<CognitiveMessage>` and handles:
-/// - `UserChat`: generates a response via the Nexus and replies.
-/// - `SecurityAlert`: interrupts current work to address the threat.
-/// - `SubconsciousInsight`: stores insights for context enrichment.
+/// Creates a [`ReActAgent`] at startup and routes all `UserChat` messages
+/// through the full ReAct loop (THOUGHT → ACTION → OBSERVATION) with tool
+/// dispatch, adaptive temperature, and Tauri event emission.
+///
+/// `SecurityAlert` and `SubconsciousInsight` messages are handled inline
+/// without the ReAct agent.
 pub async fn prime_actor(
     nexus: Arc<ModelNexus>,
     mut rx: mpsc::Receiver<CognitiveMessage>,
-    ledger: Arc<Ledger>,
-    knowledge: Arc<Mutex<KnowledgeGraph>>,
+    tool_registry: ToolRegistry,
+    app_handle: Option<AppHandle>,
 ) {
-    info!("Prime actor started (with memory + knowledge + working memory)");
+    info!("Prime actor started (ReAct-enabled)");
 
-    // Rolling buffer of subconscious insights for context enrichment.
+    // Build the ReAct agent with tools and optional Tauri handle.
+    let agent = {
+        let mut a = ReActAgent::new(Arc::clone(&nexus), tool_registry);
+        if let Some(ref handle) = app_handle {
+            a = a.with_app_handle(handle.clone());
+        }
+        a
+    };
+
+    // Rolling buffer of subconscious insights for cognitive context.
     let mut insights: Vec<String> = Vec::new();
     const MAX_INSIGHTS: usize = 10;
-
-    // Working memory for cross-turn context continuity.
-    let mut working_memory = WorkingMemory::with_defaults();
 
     while let Some(msg) = rx.recv().await {
         match msg {
             CognitiveMessage::UserChat { text, reply } => {
                 info!("Prime: received user chat ({} chars)", text.len());
 
-                // ── Store user message in working memory ────────────────
-                working_memory.add(&text, "user", 0.8);
-
-                // ── Load memory context ──────────────────────────────────
-                let mut context_parts: Vec<String> = Vec::new();
-
-                // Working memory block (highest salience items).
-                let wm_block = working_memory.get_prompt_block();
-                if !wm_block.is_empty() {
-                    context_parts.push(wm_block);
-                }
-
-                // Ledger summary (goals, preferences, status).
-                let ledger_summary = ledger.get_summary();
-                if !ledger_summary.is_empty() {
-                    context_parts.push(format!("[Memory]\n{ledger_summary}"));
-                }
-
-                // Knowledge graph context — extract entity names from the query
-                // and look up adjacent knowledge.
-                {
-                    let kg = knowledge.lock().await;
-                    for word in text.split_whitespace() {
-                        let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
-                        if clean.len() >= 3 {
-                            if kg.find_entity(clean).is_some() {
-                                let kg_ctx = kg.get_context(clean);
-                                context_parts.push(format!("[Knowledge: {clean}]\n{kg_ctx}"));
-                            }
-                        }
-                    }
-                }
-
-                // Subconscious insights.
-                if !insights.is_empty() {
-                    context_parts.push(format!(
-                        "[Background awareness]\n{}",
-                        insights.join("\n")
-                    ));
-                }
-
-                // Build final prompt.
-                let user_question = text.clone();
-                let prompt = if context_parts.is_empty() {
-                    text.clone()
+                // Build cognitive context from accumulated insights.
+                let cognitive_context = if insights.is_empty() {
+                    String::new()
                 } else {
-                    let context = context_parts.join("\n\n");
-                    format!("=== SYSTEM CONTEXT ===\n{}\n======================\n\nUser Query: {}", context, text)
+                    let joined = insights.join("\n");
+                    format!("[Background Awareness / Subconscious Insights]\n{joined}")
                 };
 
-                // ── Metacognitive verified generation ────────────────────
-                match metacognition::verified_generate(
-                    &nexus,
-                    &prompt,
-                    &user_question,
-                    512,
-                    0.7,
-                )
-                .await
-                {
+                // Route through the ReAct agent (full prompt system).
+                match agent.run(&text, &cognitive_context).await {
                     Ok(response) => {
-                        // Store the response in working memory for continuity.
-                        working_memory.add(&response, "assistant", 0.6);
                         let _ = reply.send(response);
                     }
                     Err(e) => {
-                        error!("Prime generation failed: {e:#}");
+                        error!("Prime ReAct generation failed: {e:#}");
                         let _ = reply.send(format!("[ERROR] Generation failed: {e}"));
                     }
                 }
@@ -124,7 +99,7 @@ pub async fn prime_actor(
             } => {
                 warn!("Prime: SECURITY INTERRUPT — level={threat_level}, details={details}");
 
-                // Generate a security response immediately.
+                // Security alerts bypass the ReAct agent — direct generation.
                 let prompt = format!(
                     "[SECURITY ALERT — PRIORITY INTERRUPT]\n\
                      Threat Level: {threat_level}\n\
@@ -171,6 +146,7 @@ pub async fn subconscious_actor(
     prime_tx: mpsc::Sender<CognitiveMessage>,
     mut cmd_rx: mpsc::Receiver<SubconsciousCommand>,
     interval: Duration,
+    app_handle: Option<AppHandle>,
 ) {
     info!(
         "Subconscious actor started (interval={}s)",
@@ -183,10 +159,8 @@ pub async fn subconscious_actor(
             _ = tokio::time::sleep(interval) => {
                 // Periodic autonomous reflection.
                 String::from(
-                    "You are the subconscious mind of Sovereign Titan. \
-                     Review your current state and background processes. \
-                     Formulate a brief, high-level insight or goal to pass \
-                     up to the conscious Prime model. Be concise."
+                    "Reflect on your current state. What patterns do you notice? \
+                     What should you be aware of? Summarize any important insights."
                 )
             }
             cmd = cmd_rx.recv() => {
@@ -211,6 +185,22 @@ pub async fn subconscious_actor(
                         "Subconscious insight: {}...",
                         &insight[..insight.len().min(80)]
                     );
+
+                    // Emit to UI so the consciousness panel can display it.
+                    if let Some(ref handle) = app_handle {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let event = SubconsciousEvent {
+                            insight: insight.clone(),
+                            timestamp: now,
+                        };
+                        if let Err(e) = handle.emit("subconscious-insight", &event) {
+                            warn!("Failed to emit subconscious-insight event: {e}");
+                        }
+                    }
+
                     let msg = CognitiveMessage::SubconsciousInsight {
                         memory_summary: insight,
                     };
@@ -218,10 +208,12 @@ pub async fn subconscious_actor(
                         warn!("Subconscious: Prime channel closed, stopping");
                         return;
                     }
+                } else {
+                    info!("Subconscious: generated empty insight, skipping");
                 }
             }
             Err(e) => {
-                warn!("Subconscious generation failed: {e:#}");
+                error!("Subconscious generation failed: {e:#}");
             }
         }
     }
@@ -240,6 +232,7 @@ pub async fn warden_actor(
     prime_tx: mpsc::Sender<CognitiveMessage>,
     mut cmd_rx: mpsc::Receiver<WardenCommand>,
     interval: Duration,
+    app_handle: Option<AppHandle>,
 ) {
     info!("Warden actor started (interval={}s)", interval.as_secs());
 
@@ -248,9 +241,10 @@ pub async fn warden_actor(
         let context = tokio::select! {
             _ = tokio::time::sleep(interval) => {
                 String::from(
-                    "You are the Security Warden. Analyze the current system state. \
-                     You MUST output one of the following exact words in your response: \
-                     CRITICAL, HIGH, MEDIUM, LOW, or NONE. Explain your reasoning briefly."
+                    "Perform a security assessment. Check for anomalies, \
+                     suspicious processes, unusual network activity, or \
+                     unauthorized access patterns. Report threat level: \
+                     NONE, LOW, MEDIUM, HIGH, or CRITICAL."
                 )
             }
             cmd = cmd_rx.recv() => {
@@ -283,6 +277,23 @@ pub async fn warden_actor(
                     "NONE"
                 };
 
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                // Always emit scan result to UI (even NONE for status display).
+                if let Some(ref handle) = app_handle {
+                    let event = WardenEvent {
+                        threat_level: threat_level.to_string(),
+                        details: assessment.clone(),
+                        timestamp: now,
+                    };
+                    if let Err(e) = handle.emit("security-alert", &event) {
+                        warn!("Failed to emit security-alert event: {e}");
+                    }
+                }
+
                 if threat_level != "NONE" {
                     warn!("Warden: threat detected — level={threat_level}");
                     let msg = CognitiveMessage::SecurityAlert {
@@ -294,11 +305,24 @@ pub async fn warden_actor(
                         return;
                     }
                 } else {
-                    info!("Warden: perimeter nominal");
+                    info!("Warden: perimeter nominal — scan complete");
                 }
             }
             Err(e) => {
-                warn!("Warden scan failed: {e:#}");
+                error!("Warden scan failed: {e:#}");
+                // Emit error to UI so user knows warden is struggling.
+                if let Some(ref handle) = app_handle {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let event = WardenEvent {
+                        threat_level: "ERROR".to_string(),
+                        details: format!("Warden scan failed: {e}"),
+                        timestamp: now,
+                    };
+                    let _ = handle.emit("security-alert", &event);
+                }
             }
         }
     }

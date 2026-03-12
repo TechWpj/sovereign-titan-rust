@@ -284,6 +284,33 @@ impl SystemControlTool {
         }
     }
 
+    /// Open a URL in the user's default browser via Start-Process.
+    fn open_url(input: &Value) -> String {
+        let url = match input.get("url").and_then(|v| v.as_str()) {
+            Some(u) => u.trim(),
+            None => return "open_url requires a \"url\" field.".to_string(),
+        };
+
+        // Basic URL validation.
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            // Try to prepend https:// if missing.
+            let full_url = format!("https://{url}");
+            let (code, _, stderr) = Self::run_ps(&format!("Start-Process '{}'", Self::escape_ps(&full_url)));
+            return if code == 0 {
+                format!("Opened {full_url} in default browser.")
+            } else {
+                format!("Failed to open URL: {}", stderr.trim().chars().take(200).collect::<String>())
+            };
+        }
+
+        let (code, _, stderr) = Self::run_ps(&format!("Start-Process '{}'", Self::escape_ps(url)));
+        if code == 0 {
+            format!("Opened {url} in default browser.")
+        } else {
+            format!("Failed to open URL: {}", stderr.trim().chars().take(200).collect::<String>())
+        }
+    }
+
     fn power_action(action: &str) -> String {
         let cmd = match action {
             "lock" => "rundll32.exe user32.dll,LockWorkStation",
@@ -308,13 +335,15 @@ impl SystemControlTool {
     /// Normalize action aliases (e.g., "start_process" → "start_program").
     fn normalize_action(action: &str) -> &str {
         match action {
-            "start_process" | "launch" | "open" | "run" => "start_program",
+            "start_process" | "launch" | "run" => "start_program",
+            "open" => "open", // Could be open_url or start_program — dispatch checks below
             "kill" | "terminate" | "stop_process" | "end_process" => "kill_process",
             "processes" | "ps" => "list_processes",
             "start_svc" => "start_service",
             "stop_svc" => "stop_service",
             "restart_svc" => "restart_service",
             "restart_computer" | "reboot" => "restart",
+            "browse" | "navigate" => "open_url",
             other => other,
         }
     }
@@ -327,9 +356,10 @@ impl Tool for SystemControlTool {
     }
 
     fn description(&self) -> &'static str {
-        "Control the operating system: manage processes, launch programs, control services, \
-         and power actions. Input: {\"action\": \"<action>\", ...params}. \
-         Actions: start_program (name), kill_process (name), list_processes (filter?), \
+        "Control the operating system: manage processes, launch programs, open URLs, \
+         control services, and power actions. Input: {\"action\": \"<action>\", ...params}. \
+         Actions: start_program (name), open_url (url — opens in default browser), \
+         kill_process (name), list_processes (filter?), \
          start_service/stop_service/restart_service (name), lock, sleep."
     }
 
@@ -352,11 +382,29 @@ impl Tool for SystemControlTool {
                 "kill_process" => Self::kill_process(&input_clone),
                 "list_processes" => Self::list_processes(&input_clone),
                 "start_program" => Self::start_program(&input_clone),
+                "open_url" => Self::open_url(&input_clone),
+                "open" => {
+                    // Smart dispatch: if input has "url" field or target looks like a URL, open_url.
+                    // Otherwise, start_program.
+                    if input_clone.get("url").is_some() {
+                        Self::open_url(&input_clone)
+                    } else {
+                        let target = input_clone.get("name")
+                            .or(input_clone.get("target"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if target.starts_with("http://") || target.starts_with("https://") || target.contains(".com") || target.contains(".org") || target.contains(".io") {
+                            Self::open_url(&serde_json::json!({"url": target}))
+                        } else {
+                            Self::start_program(&input_clone)
+                        }
+                    }
+                }
                 "start_service" => Self::manage_service(&input_clone, "start"),
                 "stop_service" => Self::manage_service(&input_clone, "stop"),
                 "restart_service" => Self::manage_service(&input_clone, "restart"),
                 "lock" | "sleep" | "shutdown" | "restart" => Self::power_action(&action_owned),
-                other => format!("Unknown action: '{other}'. Available: start_program, kill_process, \
+                other => format!("Unknown action: '{other}'. Available: start_program, open_url, kill_process, \
                     list_processes, start_service, stop_service, restart_service, lock, sleep."),
             }
         })

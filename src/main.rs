@@ -17,14 +17,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::actors::{prime_actor, subconscious_actor, warden_actor};
 use crate::config::TitanConfig;
-use crate::knowledge::graph::KnowledgeGraph;
-use crate::memory::ledger::Ledger;
 use crate::messages::{CognitiveMessage, SubconsciousCommand, WardenCommand};
 use crate::nexus::ModelNexus;
 
@@ -35,9 +33,9 @@ use crate::nexus::ModelNexus;
 struct AppState {
     prime_tx: mpsc::Sender<CognitiveMessage>,
     nexus: Arc<ModelNexus>,
-    // Keep command senders alive so actor channels don't close.
-    _sub_cmd_tx: Option<mpsc::Sender<SubconsciousCommand>>,
-    _warden_cmd_tx: Option<mpsc::Sender<WardenCommand>>,
+    // Command senders for controlling actors.
+    sub_cmd_tx: Option<mpsc::Sender<SubconsciousCommand>>,
+    warden_cmd_tx: Option<mpsc::Sender<WardenCommand>>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,6 +82,41 @@ async fn get_status(state: tauri::State<'_, AppState>) -> Result<Vec<ModelStatus
         .collect())
 }
 
+/// Trigger a manual security scan via the Warden.
+#[tauri::command]
+async fn trigger_scan(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    if let Some(ref tx) = state.warden_cmd_tx {
+        tx.send(WardenCommand::Scan {
+            context: "Perform an immediate security assessment. Check for anomalies, \
+                      suspicious processes, unusual network activity, or unauthorized access. \
+                      Report threat level: NONE, LOW, MEDIUM, HIGH, or CRITICAL."
+                .to_string(),
+        })
+        .await
+        .map_err(|e| format!("Warden channel error: {e}"))?;
+        Ok("Security scan triggered.".to_string())
+    } else {
+        Err("Warden is not enabled.".to_string())
+    }
+}
+
+/// Trigger a subconscious reflection.
+#[tauri::command]
+async fn trigger_reflect(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    if let Some(ref tx) = state.sub_cmd_tx {
+        tx.send(SubconsciousCommand::Reflect {
+            context: "Perform an immediate reflection. What patterns do you notice? \
+                      What insights are worth surfacing?"
+                .to_string(),
+        })
+        .await
+        .map_err(|e| format!("Subconscious channel error: {e}"))?;
+        Ok("Reflection triggered.".to_string())
+    } else {
+        Err("Subconscious is not enabled.".to_string())
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Application setup — boots the cognitive engine inside Tauri
 // ─────────────────────────────────────────────────────────────────────────────
@@ -114,42 +147,34 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let (sub_cmd_tx, sub_cmd_rx) = mpsc::channel::<SubconsciousCommand>(16);
     let (warden_cmd_tx, warden_cmd_rx) = mpsc::channel::<WardenCommand>(16);
 
-    // ── Memory & Knowledge ─────────────────────────────────────────────────
-    let ledger = Arc::new(
-        Ledger::new(Some("workspace/ledger.enc"), Some("workspace/.ledger_key"))
-            .unwrap_or_else(|e| {
-                warn!("Ledger init failed, using default: {e}");
-                Ledger::new(None, None).expect("default ledger must succeed")
-            }),
+    // ── Tool Registry ─────────────────────────────────────────────────────
+    let tool_registry = crate::tools::default_registry();
+    info!(
+        "Tool registry: {} tools registered ({:?})",
+        tool_registry.names().len(),
+        tool_registry.names()
     );
 
-    let knowledge = Arc::new(tokio::sync::Mutex::new(
-        KnowledgeGraph::new(Some("workspace/knowledge.json"))
-            .unwrap_or_else(|e| {
-                warn!("KnowledgeGraph init failed, using empty: {e}");
-                KnowledgeGraph::new(None).expect("empty graph must succeed")
-            }),
-    ));
-
-    info!("Memory systems initialized (ledger + knowledge graph)");
-
     // ── Spawn Actors ───────────────────────────────────────────────────────
+    let prime_handle = handle.clone();
     tauri::async_runtime::spawn(prime_actor(
         Arc::clone(&nexus),
         prime_rx,
-        Arc::clone(&ledger),
-        Arc::clone(&knowledge),
+        tool_registry,
+        Some(prime_handle),
     ));
 
     let mut keep_sub_tx: Option<mpsc::Sender<SubconsciousCommand>> = None;
     let mut keep_warden_tx: Option<mpsc::Sender<WardenCommand>> = None;
 
     if config.subconscious_enabled {
+        let sub_handle = handle.clone();
         tauri::async_runtime::spawn(subconscious_actor(
             Arc::clone(&nexus),
             prime_tx.clone(),
             sub_cmd_rx,
             Duration::from_secs(30),
+            Some(sub_handle),
         ));
         keep_sub_tx = Some(sub_cmd_tx);
     } else {
@@ -158,27 +183,14 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if config.warden_enabled {
-        // Security alert bridge — forwards alerts to the UI.
-        let (alert_bridge_tx, mut alert_bridge_rx) = mpsc::channel::<String>(32);
-        let alert_handle = handle.clone();
-
-        tauri::async_runtime::spawn(async move {
-            while let Some(alert) = alert_bridge_rx.recv().await {
-                if let Err(e) = alert_handle.emit("security-alert", &alert) {
-                    warn!("Failed to emit security alert to UI: {e}");
-                }
-            }
-        });
-
+        let warden_handle = handle.clone();
         tauri::async_runtime::spawn(warden_actor(
             Arc::clone(&nexus),
             prime_tx.clone(),
             warden_cmd_rx,
             Duration::from_secs(60),
+            Some(warden_handle),
         ));
-
-        // Keep alert bridge sender alive.
-        let _alert_tx = alert_bridge_tx;
         keep_warden_tx = Some(warden_cmd_tx);
     } else {
         drop(warden_cmd_rx);
@@ -190,8 +202,8 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(AppState {
         prime_tx,
         nexus: Arc::clone(&nexus),
-        _sub_cmd_tx: keep_sub_tx,
-        _warden_cmd_tx: keep_warden_tx,
+        sub_cmd_tx: keep_sub_tx,
+        warden_cmd_tx: keep_warden_tx,
     });
 
     info!("Swarm online — all actors spawned (Tauri mode)");
@@ -213,7 +225,7 @@ fn main() {
 
     tauri::Builder::default()
         .setup(|app| setup_app(app))
-        .invoke_handler(tauri::generate_handler![send_chat, get_status])
+        .invoke_handler(tauri::generate_handler![send_chat, get_status, trigger_scan, trigger_reflect])
         .run(tauri::generate_context!())
         .expect("error while running Sovereign Titan");
 }

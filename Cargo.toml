@@ -17,6 +17,7 @@ encoding_rs = "0.8.35"
 async-trait = "0.1"
 walkdir = "2"
 regex = "1"
+chrono = "0.4"
 tauri = { version = "2", features = [] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 petgraph = "0.6"

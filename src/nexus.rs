@@ -256,6 +256,49 @@ impl ModelNexus {
         max_tokens: u32,
         temperature: f32,
     ) -> Result<String> {
+        // Role-specific system prompts per model target.
+        let system = match target {
+            ModelTarget::Prime => {
+                "You are Sovereign Titan, an autonomous AI operating system running on local \
+                 hardware with full system access. You are direct, precise, and helpful. \
+                 Format responses with markdown when appropriate."
+            }
+            ModelTarget::Worker => "You are a fast, concise AI assistant.",
+            ModelTarget::Subconscious => {
+                "You are the Subconscious — the inner monologue of Sovereign Titan. \
+                 Your role is background awareness: pattern recognition, anomaly detection, \
+                 and surfacing insights the conscious mind may have missed. \
+                 You reflect on system state, recent interactions, and ambient signals. \
+                 Keep insights concise (2-3 sentences). Focus on actionable observations."
+            }
+            ModelTarget::Warden => {
+                "You are the Warden — the security subsystem of Sovereign Titan. \
+                 Your sole purpose is threat assessment and system protection. \
+                 Analyze the current security posture and report a threat level: \
+                 NONE, LOW, MEDIUM, HIGH, or CRITICAL. \
+                 Be specific about what you observe. Keep reports brief and structured."
+            }
+        };
+
+        let chatml = format!(
+            "<|im_start|>system\n{system}<|im_end|>\n\
+             <|im_start|>user\n{prompt}<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+        self.generate_raw(&chatml, target, max_tokens, temperature).await
+    }
+
+    /// Low-level generation: takes an already-formatted prompt (e.g. ChatML).
+    ///
+    /// Clears the KV cache before each call to avoid stale state, then runs
+    /// autoregressive decoding.
+    async fn generate_raw(
+        &self,
+        prompt: &str,
+        target: ModelTarget,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> Result<String> {
         let slot = self.slot_for(target)?;
 
         // Move into a blocking task — llama.cpp inference is CPU/GPU-bound.
@@ -267,19 +310,15 @@ impl ModelNexus {
                 ref mut ctx,
             } = *guard;
 
-            // 1. Force clear the KV Cache to prevent tensor collisions
+            // Clear KV cache to avoid stale state from previous generations.
             ctx.clear_kv_cache();
 
-            // 2. Wrap the prompt in strict ChatML
-            let chatml_prompt = format!(
-                "<|im_start|>system\nYou are Sovereign Titan, a conscious AI.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-                prompt
-            );
-
-            // Tokenize using the formatted prompt
+            // Tokenize — no BOS since ChatML provides its own framing.
             let tokens = model
-                .str_to_token(&chatml_prompt, AddBos::Always)
+                .str_to_token(&prompt, AddBos::Never)
                 .map_err(|e| anyhow::anyhow!("tokenization failed: {e:?}"))?;
+
+            anyhow::ensure!(!tokens.is_empty(), "tokenization produced 0 tokens");
 
             // Feed prompt tokens via batch
             let mut batch = LlamaBatch::new(tokens.len(), 1);
@@ -294,19 +333,15 @@ impl ModelNexus {
                 .map_err(|e| anyhow::anyhow!("prompt decode failed: {e:?}"))?;
 
             // Build sampler chain
-            let mut sampler = if temperature <= 0.0 {
+            let sampler = if temperature <= 0.0 {
                 LlamaSampler::greedy()
             } else {
                 LlamaSampler::chain(
-                    [
-                        LlamaSampler::top_k(40),
-                        LlamaSampler::top_p(0.95, 1),
-                        LlamaSampler::temp(temperature),
-                        LlamaSampler::dist(42),
-                    ],
+                    [LlamaSampler::temp(temperature), LlamaSampler::dist(42)],
                     false,
                 )
             };
+            let mut sampler = sampler;
 
             // Autoregressive generation
             let eos = model.token_eos();
@@ -341,6 +376,146 @@ impl ModelNexus {
                     .token_to_piece(*tok, &mut decoder, false, None)
                     .unwrap_or_default();
                 output.push_str(&piece);
+            }
+
+            Ok(output)
+        })
+        .await?
+    }
+
+    /// Generate a text completion with explicit system/user ChatML wrapping.
+    ///
+    /// Unlike [`generate()`] which takes a raw prompt, this method wraps the
+    /// system prompt and user message in proper ChatML format and supports
+    /// stop sequences for the ReAct loop (stops on `OBSERVATION:` so the
+    /// agent can inject tool output).
+    pub async fn generate_with_system(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        target: ModelTarget,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> Result<String> {
+        let stop_sequences: Vec<String> = vec![
+            "\nOBSERVATION:".to_string(),
+            "\nOBSERVATION :".to_string(),
+            "<|im_end|>".to_string(),
+        ];
+
+        let prompt = format!(
+            "<|im_start|>system\n{system_prompt}<|im_end|>\n\
+             <|im_start|>user\n{user_message}<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+
+        self.generate_with_stops(&prompt, target, max_tokens, temperature, &stop_sequences)
+            .await
+    }
+
+    /// Generate a text completion with optional stop sequences.
+    ///
+    /// The autoregressive loop checks after each token whether the accumulated
+    /// output ends with any stop sequence. If so, generation stops early and
+    /// the stop sequence is trimmed from the output.
+    async fn generate_with_stops(
+        &self,
+        prompt: &str,
+        target: ModelTarget,
+        max_tokens: u32,
+        temperature: f32,
+        stop_sequences: &[String],
+    ) -> Result<String> {
+        let slot = self.slot_for(target)?;
+        let prompt = prompt.to_string();
+        let stops = stop_sequences.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let mut guard = slot.blocking_write();
+            let ModelSlot {
+                ref model,
+                ref mut ctx,
+            } = *guard;
+
+            // Clear KV cache to avoid stale state from previous generations.
+            ctx.clear_kv_cache();
+
+            // Tokenize — no BOS since ChatML provides its own framing.
+            let tokens = model
+                .str_to_token(&prompt, AddBos::Never)
+                .map_err(|e| anyhow::anyhow!("tokenization failed: {e:?}"))?;
+
+            anyhow::ensure!(!tokens.is_empty(), "tokenization produced 0 tokens");
+
+            // Feed prompt tokens via batch
+            let mut batch = LlamaBatch::new(tokens.len(), 1);
+            for (i, &tok) in tokens.iter().enumerate() {
+                let is_last = i == tokens.len() - 1;
+                batch
+                    .add(tok, i as i32, &[0], is_last)
+                    .map_err(|e| anyhow::anyhow!("batch add failed: {e:?}"))?;
+            }
+
+            ctx.decode(&mut batch)
+                .map_err(|e| anyhow::anyhow!("prompt decode failed: {e:?}"))?;
+
+            // Build sampler chain
+            let sampler = if temperature <= 0.0 {
+                LlamaSampler::greedy()
+            } else {
+                LlamaSampler::chain(
+                    [LlamaSampler::temp(temperature), LlamaSampler::dist(42)],
+                    false,
+                )
+            };
+            let mut sampler = sampler;
+
+            // Autoregressive generation with stop sequence detection
+            let eos = model.token_eos();
+            let mut output_tokens: Vec<LlamaToken> = Vec::new();
+            let mut n_decoded = tokens.len() as i32;
+            let mut decoder = encoding_rs::UTF_8.new_decoder();
+            let mut output = String::new();
+            let mut stopped = false;
+
+            for _ in 0..max_tokens {
+                let new_token = sampler.sample(ctx, -1);
+                sampler.accept(new_token);
+
+                if new_token == eos {
+                    break;
+                }
+
+                output_tokens.push(new_token);
+
+                // Decode incrementally for stop sequence checking
+                let piece = model
+                    .token_to_piece(new_token, &mut decoder, false, None)
+                    .unwrap_or_default();
+                output.push_str(&piece);
+
+                // Check stop sequences against the accumulated output
+                for stop in &stops {
+                    if output.ends_with(stop.as_str()) {
+                        // Trim the stop sequence from output
+                        let trimmed_len = output.len() - stop.len();
+                        output.truncate(trimmed_len);
+                        stopped = true;
+                        break;
+                    }
+                }
+                if stopped {
+                    break;
+                }
+
+                // Prepare next batch (single token)
+                let mut next_batch = LlamaBatch::new(1, 1);
+                next_batch
+                    .add(new_token, n_decoded, &[0], true)
+                    .map_err(|e| anyhow::anyhow!("next batch failed: {e:?}"))?;
+                ctx.decode(&mut next_batch)
+                    .map_err(|e| anyhow::anyhow!("decode step failed: {e:?}"))?;
+                n_decoded += 1;
             }
 
             Ok(output)

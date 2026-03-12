@@ -130,16 +130,32 @@ export async function listAutomations() {
   return { tasks: [] };
 }
 
-// --- Security (stubs) ---
+// --- Security ---
 
 export async function getSecurityEvents(level = null, limit = 100) {
   return { events: [] };
 }
 
 export async function triggerSecurityScan() {
-  return {};
+  try {
+    const result = await invoke('trigger_scan');
+    return { status: 'triggered', message: result };
+  } catch (e) {
+    return { status: 'error', message: String(e) };
+  }
 }
 
 export async function getSecurityReport() {
   return {};
+}
+
+// --- Subconscious ---
+
+export async function triggerReflect() {
+  try {
+    const result = await invoke('trigger_reflect');
+    return { status: 'triggered', message: result };
+  } catch (e) {
+    return { status: 'error', message: String(e) };
+  }
 }

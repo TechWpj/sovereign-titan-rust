@@ -10,13 +10,28 @@ export function useEventStream() {
   const [dialogueMessages, setDialogueMessages] = useState([]);
 
   useEffect(() => {
-    let unlisten;
+    let unlistenSecurity;
+    let unlistenSubconscious;
 
     async function setup() {
-      unlisten = await listen('security-alert', (event) => {
+      unlistenSecurity = await listen('security-alert', (event) => {
         try {
           const alert = event.payload;
           setSecurityAlerts((prev) => [alert, ...prev.slice(-99)]);
+        } catch {}
+      });
+
+      unlistenSubconscious = await listen('subconscious-insight', (event) => {
+        try {
+          const insight = event.payload;
+          setThoughts((prev) => [
+            {
+              category: 'subconscious',
+              text: insight.insight,
+              timestamp: insight.timestamp * 1000,
+            },
+            ...prev.slice(-49),
+          ]);
         } catch {}
       });
     }
@@ -24,7 +39,8 @@ export function useEventStream() {
     setup();
 
     return () => {
-      if (unlisten) unlisten();
+      if (unlistenSecurity) unlistenSecurity();
+      if (unlistenSubconscious) unlistenSubconscious();
     };
   }, []);
 

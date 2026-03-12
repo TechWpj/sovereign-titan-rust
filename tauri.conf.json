@@ -16,9 +16,10 @@
         "label": "main",
         "title": "Sovereign Titan",
         "transparent": true,
-        "decorations": false,
-        "alwaysOnTop": true,
-        "fullscreen": true,
+        "decorations": true,
+        "alwaysOnTop": false,
+        "fullscreen": false,
+        "maximized": true,
         "width": 1920,
         "height": 1080
       }
