@@ -1,0 +1,244 @@
+---
+name: research
+description: "Use this skill when the user needs research conducted and documented. Triggers include: requests to research a topic, investigate a subject, create a research document or report, expand knowledge on a topic, gather information for later use, build context for a project, fact-check claims with sources, produce a comprehensive analysis, or generate a knowledge document. Also trigger when the user says 'look into', 'find out about', 'deep dive into', 'write a research paper on', 'gather information about', or 'I need to understand'. This skill orchestrates multiple tools in a research pipeline to produce thorough, sourced, and saved research outputs."
+---
+
+# Research Document Generation Skill
+
+## Overview
+
+This skill orchestrates Sovereign Titan's existing tools into a structured research pipeline. It produces sourced, verified, and professionally formatted research documents that can be saved for later reference, used to expand the system's knowledge base, or delivered as standalone reports.
+
+## When to Use
+
+- User asks to research a topic and produce a document/report
+- User needs comprehensive information gathered and organized
+- User wants context saved for future conversations (knowledge expansion)
+- User asks for fact-checking with sources
+- User needs a deep-dive analysis on any subject
+- User wants to "look into" something and have findings documented
+
+## Research Pipeline — Tool Integration
+
+The research process uses these tools in sequence. Each step builds on the previous.
+
+### Step 1: Scope & Plan
+
+Before touching any tool, clarify the research scope:
+- **Topic**: What exactly is being researched?
+- **Depth**: Surface overview (3-5 sources) or deep investigation (10-20+ sources)?
+- **Output format**: Markdown file, Word document (.docx), PDF, or just a chat summary?
+- **Audience**: Technical peers, executives, general public?
+- **Time sensitivity**: Is recency critical (last month/year) or is historical context fine?
+
+If the user doesn't specify, default to: medium depth, markdown file, general audience.
+
+### Step 2: Initial Research (web_search)
+
+Use **web_search** to gather information from multiple angles:
+
+```
+ACTION: web_search
+ACTION_INPUT: {"query": "<topic> overview 2025"}
+```
+
+**Strategy — run multiple searches to triangulate:**
+1. **Broad overview**: `"<topic> explained"` or `"<topic> overview"`
+2. **Recent developments**: `"<topic> latest research 2025"` or `"<topic> recent findings"`
+3. **Expert analysis**: `"<topic> expert analysis"` or `"<topic> peer reviewed"`
+4. **Counterarguments**: `"<topic> criticism"` or `"<topic> challenges limitations"`
+5. **Data/statistics**: `"<topic> statistics data"` or `"<topic> studies numbers"`
+
+Each search returns URLs and snippets. Track the most promising sources for deeper reading.
+
+### Step 3: Deep Reading (web_fetch)
+
+For the most relevant URLs from Step 2, use **web_fetch** to retrieve full content:
+
+```
+ACTION: web_fetch
+ACTION_INPUT: {"url": "https://example.com/article-on-topic"}
+```
+
+**Best practices:**
+- Fetch 5-10 high-quality sources (prioritize .gov, .edu, .org for factual claims)
+- Extract key quotes, statistics, and findings from each source
+- Note the publication date — flag anything older than 3 years for fast-moving fields
+- Track author names and publication titles for citations
+
+### Step 4: Data Processing (code)
+
+If the research involves numerical data, statistics, or comparisons, use **code** to process and analyze:
+
+```
+ACTION: code
+ACTION_INPUT: {"language": "python", "code": "# Parse data, compute statistics, generate tables\nimport json\ndata = {...}\n# Analysis here"}
+```
+
+Use cases:
+- Summarizing statistics across multiple sources
+- Creating comparison tables
+- Computing trends or averages
+- Formatting structured data for the document
+
+### Step 5: Knowledge Storage (memory_search + file_write)
+
+**Save research for future reference** using two approaches:
+
+**A. Vector Memory (for RAG retrieval in future conversations):**
+Key findings get stored automatically when the system processes them. To check if prior research exists on this topic:
+
+```
+ACTION: memory_search
+ACTION_INPUT: {"query": "<topic>", "top_k": 5}
+```
+
+This checks the ChromaDB vector store for any existing knowledge on the topic, avoiding redundant research.
+
+**B. File-based Context Documents (for structured long-term storage):**
+Write the research output to a file for later parsing:
+
+```
+ACTION: file_write
+ACTION_INPUT: {"path": "research/<topic-slug>.md", "content": "<full research document>"}
+```
+
+**File organization convention:**
+- `research/` directory for all research outputs
+- Filename: `<topic-slug>-<date>.md` (e.g., `climate-change-midwest-2025-03-01.md`)
+- Include YAML frontmatter for metadata:
+
+```markdown
+---
+topic: Climate Change Impacts — Midwest US
+date: 2025-03-01
+sources: 12
+depth: comprehensive
+tags: [climate, agriculture, midwest, policy]
+---
+
+# Climate Change Impacts on the Midwestern United States
+...
+```
+
+This makes the document parseable by future research sessions and the document ingestion pipeline.
+
+### Step 6: Document Generation (document_create)
+
+For professional output, use **document_create** to produce formatted documents:
+
+```
+ACTION: document_create
+ACTION_INPUT: {"format": "word", "path": "C:/Users/treyd/Desktop/research-output.docx", "title": "Research Report: <Topic>", "content": "<markdown content>", "subtitle": "Comprehensive Analysis"}
+```
+
+**Format options:**
+- `"word"` — Professional .docx with cover page, TOC, headers/footers, styled headings
+- `"pdf"` — PDF document
+- `"excel"` — For data-heavy research with tables and charts
+
+**Ask the user** what format they prefer before generating. If they don't specify, default to Word (.docx) for maximum editability.
+
+### Step 7: Source Verification (web_search + web_fetch)
+
+Before finalizing, verify key claims:
+
+1. **Cross-reference**: Search for the same claim from independent sources
+2. **Check dates**: Ensure statistics are current
+3. **Identify bias**: Note if a source is industry-sponsored or opinion-based
+4. **Flag uncertainty**: Mark claims that couldn't be independently verified
+
+Add a "Sources & Methodology" section to the final document listing:
+- All sources consulted (author, title, publication, date, URL)
+- Search methodology used
+- Any limitations or caveats
+- Date of research
+
+## Research Document Structure
+
+Use this structure for comprehensive research documents:
+
+```markdown
+# [Topic]: [Specific Angle]
+
+## Executive Summary
+2-3 paragraphs summarizing key findings, conclusions, and recommendations.
+
+## Background & Context
+Why this topic matters. Historical context. Current landscape.
+
+## Key Findings
+
+### Finding 1: [Title]
+Evidence, data, and analysis. Cite sources inline.
+
+### Finding 2: [Title]
+...
+
+### Finding 3: [Title]
+...
+
+## Analysis & Implications
+What the findings mean. Trends. Projections. Trade-offs.
+
+## Counterarguments & Limitations
+Known criticisms. Gaps in the evidence. Alternative interpretations.
+
+## Recommendations
+Actionable takeaways based on the research.
+
+## Sources & Methodology
+Full citation list. Search methodology. Date of research. Caveats.
+```
+
+## Research Depth Levels
+
+| Level | Sources | Searches | Output Length | Use Case |
+|-------|---------|----------|--------------|----------|
+| **Quick** | 3-5 | 2-3 | 500-1000 words | Quick answer with citations |
+| **Standard** | 5-10 | 5-8 | 1000-3000 words | General research document |
+| **Comprehensive** | 10-20+ | 10-15 | 3000-8000 words | Deep analysis, decision support |
+| **Exhaustive** | 20+ | 15-25 | 8000+ words | Academic-grade, multi-section report |
+
+Default to **Standard** unless the user specifies otherwise or the topic clearly requires more depth.
+
+## Context Saving for Knowledge Expansion
+
+When research is meant to expand Sovereign Titan's ongoing knowledge:
+
+1. **Save the markdown file** in `research/` directory with proper frontmatter
+2. **Store key facts** in vector memory for future RAG retrieval
+3. **Update the Knowledge Graph** if entities and relationships were discovered:
+   - People, organizations, technologies mentioned
+   - Relationships between entities
+   - Timeline of events
+4. **Create a summary brief** (200-300 words) saved alongside the full document for quick future reference
+
+This creates a persistent knowledge layer that future conversations can draw from via `memory_search`.
+
+## Quality Checklist
+
+Before delivering the research document, verify:
+
+- [ ] All major claims have at least one cited source
+- [ ] Sources include publication dates
+- [ ] Counter-arguments and limitations are addressed
+- [ ] Statistics are current (flagged if older than 3 years)
+- [ ] Executive summary accurately reflects the full document
+- [ ] Document structure follows the template above
+- [ ] File saved for future reference (if requested)
+- [ ] Sources section includes full URLs for verification
+
+## Tool Reference Summary
+
+| Tool | Role in Research Pipeline |
+|------|--------------------------|
+| **web_search** | Discover sources, find data, locate experts |
+| **web_fetch** | Read full articles, extract detailed information |
+| **code** | Process data, compute statistics, generate tables |
+| **memory_search** | Check existing knowledge, avoid redundant research |
+| **file_write** | Save research documents for future reference |
+| **file_read** | Load previous research for continuation or updates |
+| **document_create** | Generate professional Word/PDF/Excel output |
+| **calculator** | Quick math for statistics and comparisons |
+| **clipboard** | Copy key findings for user convenience |

@@ -1,0 +1,137 @@
+---
+name: deep-pipeline
+description: "Guidance for multi-phase deep analysis research pipelines. Triggers when the system runs deep research, investigation, comprehensive analysis, or multi-phase document generation. Covers proper tool usage during research phases, hallucination avoidance, ledger operations, URL handling, and synthesis best practices. This is an internal skill for pipeline agents, not user-facing."
+---
+
+# Deep Research Pipeline — Agent Guidance
+
+## Purpose
+
+This document guides per-phase research agents during deep analysis pipelines.
+Each research phase runs in a fresh context with limited tools. Follow these
+rules strictly to avoid common errors and produce high-quality research data.
+
+## Tool Usage Rules
+
+### web_search
+- **Input**: `{"query": "search terms here", "max_results": 5}`
+- The `query` must be a plain-text search string, NOT a URL
+- Use specific, targeted queries: "renewable energy market size 2025" not "tell me about energy"
+- Run 3-5 searches per phase from different angles (overview, statistics, expert analysis)
+- Track which URLs appear in results for web_fetch
+
+### web_fetch
+- **Input**: `{"url": "https://example.com/actual-page", "extract_text": true}`
+- The `url` MUST be an actual URL starting with `https://` or `http://`
+- Copy URLs exactly from web_search results — do not modify or guess them
+- **NEVER pass these as URLs:**
+  - Article titles (e.g., "The Impact of Climate Change on Agriculture")
+  - Search result snippets or descriptions
+  - Made-up domains (e.g., "https://climate-research.com" without seeing it in results)
+  - Numbered references like "[2] Some Article Title"
+- If web_fetch fails with DNS error, the URL doesn't exist — use web_search to find a real one
+- Prefer .gov, .edu, .org URLs for factual claims
+
+### ledger_write
+- **Input**: `{"heading": "Phase Name — Topic", "content": "actual data here..."}`
+- BOTH `heading` and `content` are REQUIRED — never omit either field
+- The `content` must contain actual extracted data, not placeholders
+- **Good content**: `"GDP growth was 3.2% in 2024 (source: BLS.gov). Unemployment dropped to 3.7%..."`
+- **Bad content**: `""` or `"See above"` or `"Research findings"` (too vague)
+- Write to the ledger IMMEDIATELY after each successful web_search or web_fetch
+- Use descriptive headings: "Background — Key Statistics" not just "Data"
+- Maximum 10,000 characters per write
+
+### ledger_read / ledger_read_toc
+- Use `ledger_read_toc` to see all saved headings before trying to read
+- `ledger_read` requires a `heading` parameter matching an existing heading exactly
+- Use these to check what data has already been collected before searching again
+
+### calculator
+- Use for computing percentages, growth rates, averages, comparisons
+- Input: `{"expression": "((150 - 120) / 120) * 100"}`
+
+### code_execute
+- Use for data processing, table formatting, complex calculations
+- Input: `{"code": "python code here", "language": "python"}`
+
+## Forbidden Tools in Research Phases
+
+These tools are NOT available during research phases:
+- `system_control` — no starting programs, no clicking, no desktop actions
+- `screen_interact` — no looking at screen, clicking, typing
+- `window_control` — no window management
+- `screen_capture` — no screenshots
+- `browser_interact` — no browser automation
+- `audio_control` — no audio changes
+- `clipboard` — no clipboard operations
+
+Research phases are background data-gathering tasks. All UI interaction happens
+outside the research pipeline.
+
+## Common Hallucinations to Avoid
+
+### 1. Fabricated URLs
+**Wrong**: `web_fetch(url="https://www.iea.org/reports/renewable-energy-2025")`
+(URL was never seen in search results)
+
+**Right**: First `web_search(query="IEA renewable energy report 2025")`, then
+`web_fetch(url="<actual URL from search results>")`
+
+### 2. Empty ledger_write
+**Wrong**: `ledger_write(heading="Research Data")` — missing content entirely
+**Wrong**: `ledger_write(heading="Research Data", content="")` — empty content
+
+**Right**: `ledger_write(heading="Research Data", content="Solar capacity grew 45% YoY...")`
+
+### 3. Using UI tools during research
+**Wrong**: `system_control(action="click", target="search button")`
+**Right**: `web_search(query="search terms")`
+
+### 4. Passing article titles as URLs
+**Wrong**: `web_fetch(url="The Global Impact of Renewable Energy in 2025")`
+**Right**: `web_fetch(url="https://www.reuters.com/business/energy/global-renewable-2025-01-15")`
+
+### 5. Using web_search with URLs
+**Wrong**: `web_search(query="https://example.com/article")`
+**Right**: `web_fetch(url="https://example.com/article")`
+
+## Phase Execution Strategy
+
+### Phase 1: Background & Context
+- Search for definitions, history, key concepts
+- Goal: Establish foundational understanding
+- Queries: "[topic] overview", "[topic] explained", "[topic] history"
+
+### Phase 2: Key Data Collection
+- Search for statistics, numbers, quantitative data
+- Goal: Gather hard data points
+- Queries: "[topic] statistics 2025", "[topic] market size", "[topic] growth rate"
+
+### Phase 3: Expert Perspectives
+- Search for expert analysis, institutional reports
+- Goal: Authoritative viewpoints
+- Queries: "[topic] expert analysis", "[topic] research paper", "[topic] institutional report"
+
+### Phase 4: Comparative Analysis
+- Search for comparisons, alternatives, trade-offs
+- Goal: Multiple perspectives
+- Queries: "[topic] vs [alternative]", "[topic] pros cons", "[topic] comparison"
+
+### Phase 5: Recent Developments
+- Search for latest news, emerging trends
+- Goal: Current state of affairs
+- Queries: "[topic] latest 2025 2026", "[topic] recent developments", "[topic] news"
+
+### Phase 6: Gap Analysis & Verification
+- Cross-reference earlier findings, fact-check key claims
+- Goal: Verify accuracy, fill gaps
+- Read ledger first to identify unverified claims, then search for confirmation
+
+## Data Quality Standards
+
+- Always include source URLs in ledger_write content
+- Include dates/years for all statistics
+- Flag uncertainty: "reportedly", "estimated", "according to [source]"
+- Prioritize recent data (2024-2026) unless historical context is needed
+- Note when sources disagree on figures

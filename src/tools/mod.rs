@@ -5,9 +5,13 @@
 //! which allows lookup by name and produces description blocks for prompt
 //! injection.
 
+pub mod api_search;
 pub mod code;
 pub mod computer_use;
 pub mod file_search;
+pub mod media;
+pub mod os_browser;
+pub mod rag;
 pub mod shell;
 pub mod system_control;
 pub mod web;
@@ -90,5 +94,9 @@ pub fn default_registry() -> ToolRegistry {
     registry.register(Arc::new(computer_use::ComputerControlTool));
     registry.register(Arc::new(web::WebSearchTool));
     registry.register(Arc::new(code::CodeOpsTool));
+    registry.register(Arc::new(os_browser::NativeBrowserTool));
+    registry.register(Arc::new(api_search::ApiSearchTool::new()));
+    registry.register(Arc::new(media::MediaTool));
+    registry.register(Arc::new(rag::RagTool::new()));
     registry
 }

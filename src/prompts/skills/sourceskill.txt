@@ -1,0 +1,119 @@
+---
+name: source-skill
+description: "Academic and curated source routing. Trigger when user asks for scholarly, peer-reviewed, academic sources, or mentions specific databases like Semantic Scholar, arXiv, PubMed, DOAJ. Also triggers for fact-checking, citation finding, and research paper queries."
+---
+
+# Source Skill — Academic & Curated Research Sources
+
+## Overview
+When handling research tasks, Titan has access to curated academic and news sources
+beyond standard web search. Use the `academic_search` tool for scholarly queries and
+`web_search` for general results. The system automatically detects topic domains and
+routes to the most relevant sources.
+
+## Primary Sources (16 curated, free access)
+
+### Scholarly / Peer-Reviewed (with APIs — use academic_search)
+1. **Semantic Scholar** — https://www.semanticscholar.org
+   - AI-powered academic search, TLDR summaries, citation graphs
+   - Best for: CS, AI/ML, NLP, general science
+   - API: api.semanticscholar.org/graph/v1/paper/search
+
+2. **arXiv** — https://arxiv.org
+   - Open-access preprint server
+   - Best for: CS, AI/ML, physics, math, quantitative biology
+   - API: export.arxiv.org/api/query (Atom XML)
+
+3. **PubMed** — https://pubmed.ncbi.nlm.nih.gov
+   - NCBI biomedical literature database (36M+ citations)
+   - Best for: medicine, biology, health, biomedical
+   - API: NCBI E-utilities (esearch + esummary)
+
+4. **DOAJ** — https://doaj.org
+   - Directory of Open Access Journals (20K+ journals)
+   - Best for: broad scholarly coverage, open access
+   - API: doaj.org/api/search/articles
+
+5. **Hacker News** — https://news.ycombinator.com
+   - Tech community discussions, startup news
+   - Best for: CS, AI, tech industry, startups
+   - API: hn.algolia.com/api/v1/search
+
+6. **PLOS ONE** — https://journals.plos.org
+   - Open-access multidisciplinary science journal
+   - Best for: biology, medicine, general science
+   - API: api.plos.org/search
+
+### Scholarly (no direct API — use site: restriction in web_search)
+7. **SSRN** — https://www.ssrn.com
+   - Social Science Research Network (economics, law, finance)
+8. **bioRxiv** — https://www.biorxiv.org
+   - Biology preprints
+9. **medRxiv** — https://www.medrxiv.org
+   - Medical/health sciences preprints
+10. **BMC** — https://www.biomedcentral.com
+    - Open-access biomedical and life sciences
+11. **CORE** — https://core.ac.uk
+    - Aggregator of open-access research papers (300M+ papers)
+12. **MIT OpenCourseWare** — https://ocw.mit.edu
+    - Educational materials from MIT courses
+
+### News & Journalism (use site: restriction)
+13. **AP News** — https://apnews.com
+    - Associated Press wire service
+14. **Reuters** — https://www.reuters.com
+    - International news agency
+15. **The Conversation** — https://theconversation.com
+    - Academic experts writing for public audience
+16. **NPR** — https://www.npr.org
+    - National Public Radio — long-form journalism
+
+## Second-Line Sources (high quality, not in primary catalog)
+- **Nature** — https://www.nature.com
+- **IEEE Xplore** — https://ieeexplore.ieee.org
+- **Google Scholar** — https://scholar.google.com
+- **Pew Research** — https://www.pewresearch.org
+- **Our World in Data** — https://ourworldindata.org
+- **Statista** — https://www.statista.com
+- **World Bank Open Data** — https://data.worldbank.org
+
+## Tool Usage Guide
+
+### academic_search
+Use for: finding scholarly papers, preprints, citations, expert analysis
+```
+ACTION: academic_search
+PARAMS: {"query": "transformer architecture attention mechanism", "max_results": 3, "domain": "ai"}
+```
+The tool automatically detects the topic domain and queries the top 4 relevant APIs.
+
+### web_search with site: restriction
+For sources without APIs, use site: in the query:
+```
+ACTION: web_search
+PARAMS: {"query": "site:ssrn.com impact of remote work on productivity"}
+```
+
+## Override Rules
+
+1. **User-specified sites always win**: If the user says "search on reuters.com" or
+   uses "site:example.com", honor that — skip automatic source routing.
+
+2. **Music playback → YouTube**: "play jazz music" routes to YouTube, not academic
+   sources. But "research the history of jazz" routes to academic sources.
+
+3. **Research indicators trigger academic sources**: Words like "research", "analyze",
+   "study", "paper", "peer-reviewed", "citation" activate academic routing.
+
+## Domain Routing
+
+| Topic | Primary Sources |
+|-------|----------------|
+| Medical/Health | PubMed, medRxiv, bioRxiv, BMC, PLOS |
+| CS/AI/ML | Semantic Scholar, arXiv, Hacker News |
+| Biology | PubMed, bioRxiv, PLOS, BMC |
+| Economics/Finance | SSRN, Reuters |
+| Law/Policy | SSRN, ProPublica |
+| General Science | Semantic Scholar, arXiv, DOAJ, PLOS, CORE |
+| Journalism/News | AP News, Reuters, The Conversation, NPR |
+| Education | MIT OCW, The Conversation |

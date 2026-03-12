@@ -225,8 +225,8 @@ pub async fn subconscious_actor(
 
 /// The Warden actor — autonomous security scanning brain.
 ///
-/// Runs periodic security scans and sends `SecurityAlert` messages to Prime
-/// when threats are detected.
+/// Runs periodic security scans using IDS, traffic, and DNS sensors,
+/// then feeds sensor data to the LLM for threat assessment.
 pub async fn warden_actor(
     nexus: Arc<ModelNexus>,
     prime_tx: mpsc::Sender<CognitiveMessage>,
@@ -235,6 +235,10 @@ pub async fn warden_actor(
     app_handle: Option<AppHandle>,
 ) {
     info!("Warden actor started (interval={}s)", interval.as_secs());
+
+    // Initialize security sensors (IDS + Traffic + DNS).
+    let mut sensors = crate::warden::sensors::SecuritySensors::new();
+    info!("Warden: security sensors initialized (IDS, Traffic, DNS)");
 
     loop {
         // Wait for either the scan interval or an explicit command.
@@ -258,9 +262,19 @@ pub async fn warden_actor(
             }
         };
 
+        // Poll security sensors for real data.
+        let sensor_data = sensors.scan();
+
+        // Combine sensor data with the scan context for the LLM.
+        let augmented_context = format!(
+            "{context}\n\n\
+             The following sensor data was collected. Analyze it and determine \
+             the threat level:\n\n{sensor_data}"
+        );
+
         // Run the security scan via the 3B warden model.
         match nexus
-            .generate(&context, ModelTarget::Warden, 256, 0.3)
+            .generate(&augmented_context, ModelTarget::Warden, 256, 0.3)
             .await
         {
             Ok(assessment) => {

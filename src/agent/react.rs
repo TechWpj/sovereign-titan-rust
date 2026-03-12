@@ -7,6 +7,7 @@
 //! and the loop continues until a `FINAL_ANSWER:` is produced or the
 //! maximum number of steps is reached.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -31,6 +32,21 @@ pub struct AgentStepEvent {
     pub step: usize,
     pub step_type: String, // "thought", "action", "observation", "final_answer"
     pub content: String,
+}
+
+/// Dedicated thought event for the `agent-thought` channel.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentThoughtEvent {
+    pub step: usize,
+    pub thought: String,
+}
+
+/// Dedicated action event for the `agent-action` channel.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentActionEvent {
+    pub step: usize,
+    pub tool: String,
+    pub input: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -72,6 +88,157 @@ fn adaptive_temperature(query: &str) -> f32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Fallback cascade — tool health tracking and error recovery
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Tracks tool failure counts and marks tools as offline after repeated failures.
+///
+/// Ported from Python `fallback_cascades.py`.
+pub struct ToolHealthTracker {
+    failure_counts: HashMap<String, usize>,
+    offline_tools: HashSet<String>,
+    reroute_map: HashMap<&'static str, &'static str>,
+}
+
+/// Number of consecutive failures before a tool is marked offline.
+const OFFLINE_THRESHOLD: usize = 3;
+
+impl ToolHealthTracker {
+    /// Create a new health tracker with default reroute mappings.
+    pub fn new() -> Self {
+        let mut reroute_map = HashMap::new();
+        reroute_map.insert("web_search", "api_search");
+        reroute_map.insert("api_search", "web_search");
+        reroute_map.insert("open_browser", "system_control");
+
+        Self {
+            failure_counts: HashMap::new(),
+            offline_tools: HashSet::new(),
+            reroute_map,
+        }
+    }
+
+    /// Record a tool failure. Returns true if the tool just went offline.
+    pub fn record_failure(&mut self, tool_name: &str) -> bool {
+        let count = self.failure_counts.entry(tool_name.to_string()).or_insert(0);
+        *count += 1;
+        if *count >= OFFLINE_THRESHOLD && !self.offline_tools.contains(tool_name) {
+            self.offline_tools.insert(tool_name.to_string());
+            warn!(
+                "FALLBACK: {} has failed {} times — marked OFFLINE",
+                tool_name, count
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record a tool success — resets failure count.
+    pub fn record_success(&mut self, tool_name: &str) {
+        self.failure_counts.insert(tool_name.to_string(), 0);
+    }
+
+    /// Check if a tool is offline.
+    pub fn is_offline(&self, tool_name: &str) -> bool {
+        self.offline_tools.contains(tool_name)
+    }
+
+    /// Get an alternative tool when the requested tool is offline.
+    pub fn get_reroute(&self, tool_name: &str) -> Option<&str> {
+        self.reroute_map
+            .get(tool_name)
+            .copied()
+            .filter(|alt| !self.offline_tools.contains(*alt))
+    }
+
+    /// Get the failure count for a tool.
+    pub fn failure_count(&self, tool_name: &str) -> usize {
+        self.failure_counts.get(tool_name).copied().unwrap_or(0)
+    }
+
+    /// Get the set of offline tools.
+    pub fn offline_tools(&self) -> &HashSet<String> {
+        &self.offline_tools
+    }
+
+    /// Generate a SYSTEM_ALERT observation for a failed tool.
+    ///
+    /// Handles offline detection, rerouting, and error-specific recovery
+    /// guidance (deterministic fallback cascades).
+    pub fn handle_failure(&mut self, tool_name: &str, error: &str) -> String {
+        // Check if already offline.
+        if self.is_offline(tool_name) {
+            if let Some(alt) = self.get_reroute(tool_name) {
+                return format!(
+                    "SYSTEM_ALERT: {tool_name} is OFFLINE. Use '{alt}' instead."
+                );
+            }
+            return format!(
+                "SYSTEM_ALERT: {tool_name} is OFFLINE and no alternative available. \
+                 Try a different approach."
+            );
+        }
+
+        // Record this failure.
+        let went_offline = self.record_failure(tool_name);
+
+        if went_offline {
+            let msg = format!(
+                "SYSTEM_ALERT: {tool_name} has failed {OFFLINE_THRESHOLD} times \
+                 and is now OFFLINE."
+            );
+            if let Some(alt) = self.get_reroute(tool_name) {
+                return format!("{msg} Routing to '{alt}' as fallback.");
+            }
+            return msg;
+        }
+
+        // Error-specific recovery guidance.
+        let error_lower = error.to_lowercase();
+        let count = self.failure_count(tool_name);
+
+        if error_lower.contains("timeout") {
+            format!(
+                "SYSTEM_ALERT: {tool_name} timed out (attempt {count}/{OFFLINE_THRESHOLD}). \
+                 Retry or try an alternative tool."
+            )
+        } else if error_lower.contains("permission") || error_lower.contains("denied") {
+            format!(
+                "SYSTEM_ALERT: {tool_name} — permission denied. \
+                 The resource may be locked or protected."
+            )
+        } else if error_lower.contains("not found") {
+            format!(
+                "SYSTEM_ALERT: {tool_name} — resource not found. \
+                 Check the input and try again."
+            )
+        } else if error_lower.contains("connection") || error_lower.contains("network") {
+            format!(
+                "SYSTEM_ALERT: {tool_name} — connection error (attempt {count}/{OFFLINE_THRESHOLD}). \
+                 Check network and retry."
+            )
+        } else {
+            format!(
+                "Tool error (attempt {count}/{OFFLINE_THRESHOLD}): {error}"
+            )
+        }
+    }
+
+    /// Reset all counters (new session).
+    pub fn reset(&mut self) {
+        self.failure_counts.clear();
+        self.offline_tools.clear();
+    }
+}
+
+impl Default for ToolHealthTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ReAct step parsing
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -96,11 +263,16 @@ pub enum ReActStep {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The ReAct agent — drives the THOUGHT → ACTION → OBSERVATION loop.
+///
+/// Includes a [`ToolHealthTracker`] for fallback cascade support:
+/// if a tool fails 3 consecutive times it is marked offline and the
+/// agent is guided to use an alternative.
 pub struct ReActAgent {
     nexus: Arc<ModelNexus>,
     registry: ToolRegistry,
     app_handle: Option<AppHandle>,
     max_tokens: u32,
+    health: std::sync::Mutex<ToolHealthTracker>,
 }
 
 impl ReActAgent {
@@ -111,6 +283,7 @@ impl ReActAgent {
             registry,
             app_handle: None,
             max_tokens: 1024,
+            health: std::sync::Mutex::new(ToolHealthTracker::new()),
         }
     }
 
@@ -130,6 +303,33 @@ impl ReActAgent {
             };
             if let Err(e) = handle.emit("agent-step", &event) {
                 warn!("Failed to emit agent-step event: {e}");
+            }
+        }
+    }
+
+    /// Emit a dedicated `agent-thought` event for THOUGHT: blocks.
+    fn emit_thought(&self, step: usize, thought: &str) {
+        if let Some(ref handle) = self.app_handle {
+            let event = AgentThoughtEvent {
+                step,
+                thought: thought.to_string(),
+            };
+            if let Err(e) = handle.emit("agent-thought", &event) {
+                warn!("Failed to emit agent-thought event: {e}");
+            }
+        }
+    }
+
+    /// Emit a dedicated `agent-action` event for ACTION: blocks.
+    fn emit_action(&self, step: usize, tool: &str, input: &str) {
+        if let Some(ref handle) = self.app_handle {
+            let event = AgentActionEvent {
+                step,
+                tool: tool.to_string(),
+                input: input.to_string(),
+            };
+            if let Err(e) = handle.emit("agent-action", &event) {
+                warn!("Failed to emit agent-action event: {e}");
             }
         }
     }
@@ -273,6 +473,7 @@ impl ReActAgent {
                 ReActStep::FinalAnswer { thought, answer } => {
                     info!("ReAct final thought: {thought}");
                     self.emit_step(step, "thought", &thought);
+                    self.emit_thought(step, &thought);
                     self.emit_step(step, "final_answer", &answer);
                     return Ok(answer);
                 }
@@ -285,10 +486,21 @@ impl ReActAgent {
                     info!("ReAct action: {action}({action_input})");
 
                     self.emit_step(step, "thought", &thought);
+                    self.emit_thought(step, &thought);
                     self.emit_step(step, "action", &format!("{action}({action_input})"));
+                    self.emit_action(step, &action, &action_input);
+
+                    // Check if the tool is offline (fallback cascade).
+                    let is_offline = {
+                        let h = self.health.lock().unwrap();
+                        h.is_offline(&action)
+                    };
 
                     // Look up the tool.
-                    let observation = if let Some(tool) = self.registry.get(&action) {
+                    let observation = if is_offline {
+                        let mut h = self.health.lock().unwrap();
+                        h.handle_failure(&action, "tool is offline")
+                    } else if let Some(tool) = self.registry.get(&action) {
                         // Parse the action input as JSON.
                         let input: serde_json::Value =
                             serde_json::from_str(&action_input).unwrap_or_else(|_| {
@@ -296,8 +508,16 @@ impl ReActAgent {
                             });
 
                         match tool.execute(input).await {
-                            Ok(result) => result,
-                            Err(e) => format!("Tool error: {e}"),
+                            Ok(result) => {
+                                // Record success — resets failure count.
+                                self.health.lock().unwrap().record_success(&action);
+                                result
+                            }
+                            Err(e) => {
+                                // Record failure — may trigger offline.
+                                let mut h = self.health.lock().unwrap();
+                                h.handle_failure(&action, &e.to_string())
+                            }
                         }
                     } else {
                         format!("Unknown tool: \"{action}\". Available tools: {:?}", self.registry.names())
@@ -424,5 +644,123 @@ mod tests {
     fn test_build_system_prompt_no_context() {
         let prompt = ReActAgent::build_system_prompt("- **shell**: run commands", "");
         assert!(!prompt.contains("Cognitive Context"));
+    }
+
+    // ─── Fallback cascade tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_health_tracker_record_failure() {
+        let mut tracker = ToolHealthTracker::new();
+        assert_eq!(tracker.failure_count("web_search"), 0);
+
+        tracker.record_failure("web_search");
+        assert_eq!(tracker.failure_count("web_search"), 1);
+        assert!(!tracker.is_offline("web_search"));
+
+        tracker.record_failure("web_search");
+        assert_eq!(tracker.failure_count("web_search"), 2);
+        assert!(!tracker.is_offline("web_search"));
+
+        // Third failure → offline.
+        tracker.record_failure("web_search");
+        assert!(tracker.is_offline("web_search"));
+    }
+
+    #[test]
+    fn test_health_tracker_success_resets() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.record_failure("shell");
+        tracker.record_failure("shell");
+        assert_eq!(tracker.failure_count("shell"), 2);
+
+        tracker.record_success("shell");
+        assert_eq!(tracker.failure_count("shell"), 0);
+        assert!(!tracker.is_offline("shell"));
+    }
+
+    #[test]
+    fn test_health_tracker_reroute() {
+        let mut tracker = ToolHealthTracker::new();
+
+        // Mark web_search offline.
+        for _ in 0..3 {
+            tracker.record_failure("web_search");
+        }
+        assert!(tracker.is_offline("web_search"));
+
+        // Should reroute to api_search.
+        assert_eq!(tracker.get_reroute("web_search"), Some("api_search"));
+
+        // If api_search is also offline, no reroute.
+        for _ in 0..3 {
+            tracker.record_failure("api_search");
+        }
+        assert_eq!(tracker.get_reroute("web_search"), None);
+    }
+
+    #[test]
+    fn test_health_tracker_handle_failure_timeout() {
+        let mut tracker = ToolHealthTracker::new();
+        let msg = tracker.handle_failure("shell", "Connection timeout occurred");
+        assert!(msg.contains("timed out"));
+        assert!(msg.contains("attempt 1/3"));
+    }
+
+    #[test]
+    fn test_health_tracker_handle_failure_permission() {
+        let mut tracker = ToolHealthTracker::new();
+        let msg = tracker.handle_failure("file_search", "Permission denied");
+        assert!(msg.contains("permission denied"));
+    }
+
+    #[test]
+    fn test_health_tracker_handle_failure_not_found() {
+        let mut tracker = ToolHealthTracker::new();
+        let msg = tracker.handle_failure("system_control", "Program not found");
+        assert!(msg.contains("not found"));
+    }
+
+    #[test]
+    fn test_health_tracker_handle_failure_goes_offline() {
+        let mut tracker = ToolHealthTracker::new();
+        tracker.handle_failure("web_search", "error 1");
+        tracker.handle_failure("web_search", "error 2");
+        let msg = tracker.handle_failure("web_search", "error 3");
+        assert!(msg.contains("OFFLINE"));
+        assert!(msg.contains("api_search"));
+    }
+
+    #[test]
+    fn test_health_tracker_already_offline() {
+        let mut tracker = ToolHealthTracker::new();
+        for _ in 0..3 {
+            tracker.record_failure("web_search");
+        }
+        let msg = tracker.handle_failure("web_search", "still broken");
+        assert!(msg.contains("OFFLINE"));
+        assert!(msg.contains("api_search"));
+    }
+
+    #[test]
+    fn test_health_tracker_reset() {
+        let mut tracker = ToolHealthTracker::new();
+        for _ in 0..3 {
+            tracker.record_failure("shell");
+        }
+        assert!(tracker.is_offline("shell"));
+
+        tracker.reset();
+        assert!(!tracker.is_offline("shell"));
+        assert_eq!(tracker.failure_count("shell"), 0);
+    }
+
+    #[test]
+    fn test_health_tracker_offline_tools_set() {
+        let mut tracker = ToolHealthTracker::new();
+        assert!(tracker.offline_tools().is_empty());
+        for _ in 0..3 {
+            tracker.record_failure("web_search");
+        }
+        assert!(tracker.offline_tools().contains("web_search"));
     }
 }

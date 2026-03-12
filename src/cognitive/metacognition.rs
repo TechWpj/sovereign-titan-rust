@@ -1,9 +1,14 @@
-//! Metacognition — self-verification loop for hallucination detection.
+//! Metacognition — multi-draft generation with LLM-as-judge verification.
 //!
-//! Ported from `sovereign_titan/cognitive/thompson_sampling.py` (verification aspect).
-//! Before the PrimeActor sends its final response, this module evaluates the
-//! output for hallucinations using a strict internal prompt. If it fails,
-//! forces a retry (up to MAX_RETRIES times).
+//! Combines Thompson Sampling (diverse draft generation) with the Truth Engine
+//! (LLM-based draft selection) to produce higher-quality responses than
+//! single-pass greedy generation.
+//!
+//! Pipeline:
+//! 1. Thompson Sampler generates 3 drafts at varied temperatures
+//! 2. Truth Engine judges the drafts and selects the best one
+//! 3. Hallucination verifier checks the winning draft
+//! 4. If verification fails, retry with the next-best draft
 
 use std::sync::Arc;
 
@@ -12,8 +17,11 @@ use tracing::{info, warn};
 
 use crate::nexus::{ModelNexus, ModelTarget};
 
+use super::thompson::ThompsonSampler;
+use super::truth::TruthEngine;
+
 /// Maximum number of verification retries before accepting the response.
-const MAX_RETRIES: u32 = 3;
+const MAX_RETRIES: u32 = 2;
 
 /// The internal verification prompt template.
 const VERIFICATION_PROMPT: &str = "\
@@ -41,10 +49,12 @@ pub enum VerifyResult {
     Fail { reason: String },
 }
 
-/// Run the metacognitive verification loop on a candidate response.
+/// Run the full metacognitive pipeline on a prompt.
 ///
-/// Generates the response, verifies it, and retries up to MAX_RETRIES times
-/// if it fails verification. Returns the best response available.
+/// 1. Thompson Sampling: generate 3 diverse drafts
+/// 2. Truth Engine: select the best draft via LLM judgment
+/// 3. Verification: check the winner for hallucinations
+/// 4. Retry: if verification fails, fall back to next-best draft
 pub async fn verified_generate(
     nexus: &Arc<ModelNexus>,
     prompt: &str,
@@ -52,54 +62,73 @@ pub async fn verified_generate(
     max_tokens: u32,
     temperature: f32,
 ) -> Result<String> {
-    let mut best_response = String::new();
+    // Step 1: Generate diverse drafts via Thompson Sampling.
+    info!("Metacognition: generating {} diverse drafts", 3);
+    let drafts = ThompsonSampler::sample_drafts(nexus, prompt, max_tokens, temperature).await;
 
-    for attempt in 0..=MAX_RETRIES {
-        // Generate (or re-generate) the response.
-        let response = if attempt == 0 {
-            nexus
-                .generate(prompt, ModelTarget::Prime, max_tokens, temperature)
-                .await?
-        } else {
-            // On retry, add a hint to avoid the previous failure.
-            let retry_prompt = format!(
-                "{prompt}\n\n[System: Your previous response may have contained inaccuracies. \
-                 Please provide a careful, well-grounded answer. Only state facts you are confident about.]"
-            );
-            nexus
-                .generate(&retry_prompt, ModelTarget::Prime, max_tokens, temperature * 0.8)
-                .await?
-        };
+    if drafts.is_empty() {
+        warn!("Metacognition: all drafts failed, falling back to single generation");
+        return nexus
+            .generate(prompt, ModelTarget::Prime, max_tokens, temperature)
+            .await;
+    }
 
-        best_response = response.clone();
+    // Step 2: Truth Engine selects the best draft.
+    let winner = TruthEngine::select_best(nexus, &drafts, user_question).await?;
+    info!(
+        "Metacognition: Truth Engine selected draft {} (temp={:.2}, {} chars)",
+        winner.index,
+        winner.temperature,
+        winner.text.len()
+    );
 
-        // Verify the response.
-        match verify_response(nexus, user_question, &response).await {
+    // Step 3: Verify the winning draft for hallucinations.
+    match verify_response(nexus, user_question, &winner.text).await {
+        Ok(VerifyResult::Pass) => {
+            info!("Metacognition: winner passed verification");
+            return Ok(winner.text);
+        }
+        Ok(VerifyResult::Fail { reason }) => {
+            warn!("Metacognition: winner FAILED verification — {reason}");
+        }
+        Err(e) => {
+            // Verification error — accept the winner anyway.
+            warn!("Metacognition: verification error ({e}), accepting winner");
+            return Ok(winner.text);
+        }
+    }
+
+    // Step 4: Retry with remaining drafts, skipping the failed winner.
+    let remaining: Vec<_> = drafts
+        .iter()
+        .filter(|d| d.index != winner.index)
+        .collect();
+
+    for (retry, draft) in remaining.iter().enumerate() {
+        if retry as u32 >= MAX_RETRIES {
+            break;
+        }
+
+        info!("Metacognition: trying fallback draft {} (retry {})", draft.index, retry + 1);
+
+        match verify_response(nexus, user_question, &draft.text).await {
             Ok(VerifyResult::Pass) => {
-                if attempt > 0 {
-                    info!("Metacognition: response passed on retry #{attempt}");
-                }
-                return Ok(response);
+                info!("Metacognition: fallback draft {} passed on retry {}", draft.index, retry + 1);
+                return Ok(draft.text.clone());
             }
             Ok(VerifyResult::Fail { reason }) => {
-                warn!(
-                    "Metacognition: FAIL on attempt {} — {reason}",
-                    attempt + 1
-                );
-                if attempt == MAX_RETRIES {
-                    warn!("Metacognition: max retries reached, returning best effort");
-                }
+                warn!("Metacognition: fallback draft {} also failed — {reason}", draft.index);
             }
             Err(e) => {
-                // Verification itself failed (e.g., model error) — skip verification.
-                warn!("Metacognition: verification error ({e}), accepting response");
-                return Ok(response);
+                warn!("Metacognition: verification error on fallback ({e}), accepting");
+                return Ok(draft.text.clone());
             }
         }
     }
 
-    // Return whatever we have after exhausting retries.
-    Ok(best_response)
+    // All drafts failed verification — return the Truth Engine's pick as best effort.
+    warn!("Metacognition: all drafts failed verification, returning Truth Engine winner");
+    Ok(winner.text)
 }
 
 /// Verify a single response using the internal fact-checking prompt.

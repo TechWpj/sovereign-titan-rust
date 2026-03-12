@@ -4,6 +4,7 @@ mod actors;
 mod agent;
 mod cognitive;
 mod config;
+mod documents;
 mod knowledge;
 mod memory;
 mod messages;
@@ -12,6 +13,7 @@ mod routing;
 mod security;
 mod tools;
 mod warden;
+mod workflows;
 
 use std::sync::Arc;
 use std::time::Duration;
