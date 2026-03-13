@@ -131,6 +131,102 @@ pub async fn verified_generate(
     Ok(winner.text)
 }
 
+/// Run the metacognitive pipeline with ChatML system prompt wrapping.
+///
+/// This variant is designed for the ReAct agent pipeline:
+/// - Drafts are generated with `generate_with_system` (ChatML + stop sequences)
+/// - Truth Engine judges and verification use raw `generate` (separate evaluation tasks)
+///
+/// This produces higher-quality ReAct-formatted responses by generating
+/// multiple diverse drafts and selecting the best one.
+pub async fn verified_generate_with_system(
+    nexus: &Arc<ModelNexus>,
+    system_prompt: &str,
+    user_message: &str,
+    user_question: &str,
+    max_tokens: u32,
+    temperature: f32,
+) -> Result<String> {
+    // Step 1: Generate diverse drafts via Thompson Sampling (with system prompt).
+    info!("Metacognition: generating {} diverse drafts (system-prompt mode)", 3);
+    let drafts = ThompsonSampler::sample_drafts_with_system(
+        nexus,
+        system_prompt,
+        user_message,
+        max_tokens,
+        temperature,
+    )
+    .await;
+
+    if drafts.is_empty() {
+        warn!("Metacognition: all drafts failed, falling back to single generation");
+        return nexus
+            .generate_with_system(system_prompt, user_message, ModelTarget::Prime, max_tokens, temperature)
+            .await;
+    }
+
+    // If only one draft succeeded, skip judging.
+    if drafts.len() == 1 {
+        info!("Metacognition: only 1 draft, skipping judgment");
+        return Ok(drafts[0].text.clone());
+    }
+
+    // Step 2: Truth Engine selects the best draft.
+    let winner = TruthEngine::select_best(nexus, &drafts, user_question).await?;
+    info!(
+        "Metacognition: Truth Engine selected draft {} (temp={:.2}, {} chars)",
+        winner.index,
+        winner.temperature,
+        winner.text.len()
+    );
+
+    // Step 3: Verify the winning draft for hallucinations.
+    match verify_response(nexus, user_question, &winner.text).await {
+        Ok(VerifyResult::Pass) => {
+            info!("Metacognition: winner passed verification");
+            return Ok(winner.text);
+        }
+        Ok(VerifyResult::Fail { reason }) => {
+            warn!("Metacognition: winner FAILED verification — {reason}");
+        }
+        Err(e) => {
+            warn!("Metacognition: verification error ({e}), accepting winner");
+            return Ok(winner.text);
+        }
+    }
+
+    // Step 4: Retry with remaining drafts.
+    let remaining: Vec<_> = drafts
+        .iter()
+        .filter(|d| d.index != winner.index)
+        .collect();
+
+    for (retry, draft) in remaining.iter().enumerate() {
+        if retry as u32 >= MAX_RETRIES {
+            break;
+        }
+
+        info!("Metacognition: trying fallback draft {} (retry {})", draft.index, retry + 1);
+
+        match verify_response(nexus, user_question, &draft.text).await {
+            Ok(VerifyResult::Pass) => {
+                info!("Metacognition: fallback draft {} passed on retry {}", draft.index, retry + 1);
+                return Ok(draft.text.clone());
+            }
+            Ok(VerifyResult::Fail { reason }) => {
+                warn!("Metacognition: fallback draft {} also failed — {reason}", draft.index);
+            }
+            Err(e) => {
+                warn!("Metacognition: verification error on fallback ({e}), accepting");
+                return Ok(draft.text.clone());
+            }
+        }
+    }
+
+    warn!("Metacognition: all drafts failed verification, returning Truth Engine winner");
+    Ok(winner.text)
+}
+
 /// Verify a single response using the internal fact-checking prompt.
 async fn verify_response(
     nexus: &Arc<ModelNexus>,

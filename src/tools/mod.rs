@@ -5,21 +5,33 @@
 //! which allows lookup by name and produces description blocks for prompt
 //! injection.
 
+pub mod academic_search;
+pub mod advanced_research;
 pub mod api_search;
 pub mod audio_control;
+pub mod browser_interact;
 pub mod calculator;
+pub mod claude_code;
 pub mod clipboard;
 pub mod clock;
 pub mod code;
 pub mod computer_use;
+pub mod container_tools;
 pub mod document_create;
+pub mod external_ai;
+pub mod file_ops;
 pub mod file_search;
 pub mod media;
+pub mod media_processing;
 pub mod network_tools;
 pub mod os_browser;
+pub mod preflight;
+pub mod pro_document;
 pub mod process_manager;
 pub mod rag;
+pub mod schemas;
 pub mod screen_capture;
+pub mod screen_interact;
 pub mod shell;
 pub mod software_control;
 pub mod system_control;
@@ -27,6 +39,7 @@ pub mod system_map;
 pub mod text_transform;
 pub mod web;
 pub mod window_control;
+pub mod workspace_chunk;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -128,6 +141,24 @@ pub fn default_registry() -> ToolRegistry {
     // ── Wave 4: 2 new tools ──────────────────────────────────────────────
     registry.register(Arc::new(software_control::SoftwareControlTool));
     registry.register(Arc::new(document_create::DocumentCreateTool));
+
+    // ── Wave 5: 4 new tools ──────────────────────────────────────────────
+    registry.register(Arc::new(file_ops::FileOpsTool));
+    registry.register(Arc::new(container_tools::ContainerToolsTool));
+    registry.register(Arc::new(external_ai::ExternalAiTool));
+    registry.register(Arc::new(preflight::PreflightTool));
+
+    // ── Wave 7: 7 new tools ──────────────────────────────────────────────
+    registry.register(Arc::new(academic_search::AcademicSearchTool::new()));
+    registry.register(Arc::new(browser_interact::BrowserInteractTool));
+    registry.register(Arc::new(screen_interact::ScreenInteractTool));
+    registry.register(Arc::new(workspace_chunk::WorkspaceChunkTool));
+    registry.register(Arc::new(media_processing::MediaProcessingTool));
+    registry.register(Arc::new(pro_document::ProDocumentTool));
+    registry.register(Arc::new(advanced_research::AdvancedResearchTool));
+
+    // ── Wave 8: Claude Code ─────────────────────────────────────────────
+    registry.register(Arc::new(claude_code::ClaudeCodeTool));
 
     registry
 }

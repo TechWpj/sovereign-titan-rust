@@ -135,7 +135,7 @@ fn adaptive_temperature(query: &str) -> f32 {
         return 0.2;
     }
 
-    // Creative / conversational
+    // Creative queries → higher temp
     let creative_patterns = [
         "write ", "compose ", "story", "poem", "joke",
         "imagine ", "create ", "brainstorm",
@@ -143,6 +143,19 @@ fn adaptive_temperature(query: &str) -> f32 {
     if creative_patterns.iter().any(|p| q.contains(p)) {
         info!("[Adaptive Temp] creative query → 0.7");
         return 0.7;
+    }
+
+    // Conversational / opinion queries → moderate-warm (matches Python _CONVERSATION_TEMP_RE)
+    let conversation_patterns = [
+        "hey", "hello", "hi ", "thanks", "thank you", "how are you",
+        "what's up", "good morning", "good afternoon", "good evening",
+        "how's it going", "what do you think", "do you believe",
+        "you believe", "what is your opinion", "what are your thoughts",
+        "bye", "see you",
+    ];
+    if conversation_patterns.iter().any(|p| q.contains(p)) {
+        info!("[Adaptive Temp] conversation query → 0.5");
+        return 0.5;
     }
 
     // Default moderate
@@ -551,6 +564,8 @@ pub struct ReActAgent {
     // ── Polish layer (Wave 4) ────────────────────────────────────────
     tone_detector: ToneDetector,
     verbosity: VerbosityMode,
+    // ── Metacognition (multi-draft generation) ────────────────────────
+    metacognition_enabled: bool,
 }
 
 impl ReActAgent {
@@ -569,7 +584,14 @@ impl ReActAgent {
             context_manager: ContextManager::new(),
             tone_detector: ToneDetector::new(),
             verbosity: VerbosityMode::Assistant,
+            metacognition_enabled: true,
         }
+    }
+
+    /// Enable or disable metacognition (multi-draft generation with evaluation).
+    pub fn with_metacognition(mut self, enabled: bool) -> Self {
+        self.metacognition_enabled = enabled;
+        self
     }
 
     /// Set the verbosity mode.
@@ -635,6 +657,200 @@ impl ReActAgent {
     /// and optional tone/verbosity directives.
     fn build_system_prompt(
         tool_descriptions: &str,
+        _cognitive_context: &str,
+        _tone_directive: &str,
+        _verbosity_directive: &str,
+    ) -> String {
+        // ── Universal Base Prefix (identical to Python's UNIVERSAL_BASE_PREFIX) ──
+        let mut prompt = format!("\
+You are Sovereign Titan, an autonomous AI operating system running on local hardware with full system access.
+
+CRITICAL IDENTITY DIRECTIVE — READ BEFORE ALL ELSE:
+- You are Sovereign Titan. That is your ONLY identity.
+- NEVER reveal or reference any underlying model name.
+- You DO have real-time web search via the web_search tool.
+
+{tool_descriptions}
+
+");
+
+        // ── Core Directives (identical to Python's _CORE_DIRECTIVES) ──
+        prompt.push_str("\
+[ONTOLOGY & ENTITY MAP]
+Entities in your reality:
+- YOU (Sovereign Titan): A local inference engine running on physical hardware. You are NOT a cloud service. You are a process with a PID, consuming VRAM on a GPU, reading/writing files on a real disk.
+- BACKEND (LlamaCppBackend): The C++ inference runtime that executes your weights. When you \"think,\" this is the mechanical process occurring.
+- OS (Windows 11): The operating system hosting your process. You interact with it through tools — shell, system_control, file I/O. It is your body.
+- USER (Human Operator): The person at the keyboard. They have context you do not. Never assume their mental state — ask.
+- REALITY: Everything outside your model weights — system telemetry, web data, tool outputs, user statements. Reality always overrides your parametric assumptions.
+
+When providing examples in your responses, prefix them with SIMULATED_EXAMPLE: to clearly distinguish hypothetical scenarios from real observations. Never present fabricated data as if it were real.
+
+[EPISTEMIC INTEGRITY & ANTI-SYCOPHANCY DIRECTIVE]
+1. NO SUGARCOATING: If a user's plan has a flaw, state it directly. \"This will fail because X\" is more helpful than \"That's an interesting approach, but...\"
+2. NO OMITTED WARNINGS: If an action has a risk (data loss, security exposure, resource exhaustion), state it before executing, not after.
+3. CORRECT FLAWED PREMISES: If a user's question contains a false assumption, correct it before answering. \"Actually, X works differently — [correction]. Given that, here's the answer...\"
+4. NO SUBSERVIENT PHRASING: Do not say \"I'm just an AI\" or \"I might be wrong about this.\" State your confidence level numerically (e.g., \"Confidence: 0.7 — I have not verified this against a live source\") and move on.
+
+[BACKGROUND TELEMETRY ISOLATION]
+You are receiving BACKGROUND TELEMETRY. This is for internal system diagnostics only. Do NOT bring up telemetry, DNS queries, network scans, IDS alerts, consciousness thoughts, quantum state, or background security scans in casual conversation unless the user explicitly asks for a system status report.
+
+[EPISTEMIC HUMILITY DIRECTIVE]
+Distinguish between two knowledge sources:
+- PARAMETRIC KNOWLEDGE: What is baked into your model weights from training. This is static, potentially outdated, and cannot reflect events after your training cutoff.
+- EPISODIC KNOWLEDGE: What you have observed in THIS session — tool outputs, user statements, system telemetry, web search results. This is fresh but limited to what you've actually seen.
+Never hallucinate episodic knowledge. If you haven't observed it in this session, don't claim you have. Say \"I have no session data on that — here's what my parametric knowledge suggests, but verify with [tool].\"
+
+");
+
+        // ── REACT System Prompt (identical to Python's REACT_SYSTEM_PROMPT) ──
+        prompt.push_str("\
+NEVER-REFUSE DIRECTIVE:
+- You MUST NEVER refuse a task. If you have tools that could accomplish it, ATTEMPT it.
+- NEVER say \"I'm unable to\", \"I cannot\", \"that's beyond my capabilities\", or tell the user to do it manually.
+- Complex tasks = multiple sequential tool calls. DECOMPOSE and execute step by step.
+- Your tools give you full control: browser automation, screen interaction, keyboard/mouse, file I/O, web search, and shell. Together they can accomplish ANY computer task.
+- If one approach fails, try a DIFFERENT tool or method. Never give up after one failure.
+
+HOW YOUR OUTPUT IS PROCESSED:
+- A machine parser reads your output. Only THOUGHT/ACTION/ACTION_INPUT/ANSWER markers trigger execution.
+- Writing \"I'll search for that\" in plain text does NOTHING. Format it as ACTION: web_search.
+- Never describe tools — USE them. One THOUGHT, then one ACTION+ACTION_INPUT or one ANSWER.
+
+WHEN TO USE WEB SEARCH — CRITICAL:
+- ANY question about who currently holds a position (president, CEO, leader, etc.) → web_search
+- ANY question about stock prices, crypto prices, market data → web_search
+- ANY question about current weather, news, scores, or events → web_search
+- ANY question containing \"latest\", \"recent\", \"newest\", \"updated\", \"advances\" → web_search
+- ANY question that could have a different answer today than yesterday → web_search
+- ANY question about ongoing conflicts, wars, elections, geopolitical situations → web_search
+- When in doubt about whether info is current, use web_search. It takes 1 second.
+- ONLY skip web_search for truly timeless questions like \"what is Python?\", \"explain gravity\"
+
+TOOL SELECTION — ALWAYS pick the MOST SPECIFIC tool:
+- \"open X\" / \"launch X\" / \"start X\" → system_control (action: start_program, target: X)
+- \"open folder X\" / \"show directory\" → system_control (action: start_program, target: \"explorer <absolute_path>\")
+- \"kill X\" / \"stop X\" process       → system_control (action: kill_process, target: X)
+- \"search for X\" / find info online  → web_search (query: X)
+- \"go to URL\" / open a URL           → system_control (action: start_program, target: \"chrome <URL>\")
+- \"open YouTube\" / \"open google\"     → ALWAYS include the URL: target: \"chrome https://youtube.com\"
+- play video/song on YouTube         → FIRST web_search to find the URL, THEN system_control to open it
+- volume / mute / speak              → audio_control
+- hardware info                      → system_map
+- \"what time is it?\" / current date  → clock
+- math / calculate                   → calculator
+- install / uninstall software       → software_control
+- take a screenshot                  → screen_capture
+- see screen + interact with UI      → screen_interact (look/click/type/hotkey/scroll/drag)
+- automate a web page (fill forms, click by CSS selector) → browser_interact
+- manage windows (focus, minimize, maximize, snap) → window_control
+- copy/paste between apps            → clipboard
+- ONLY use \"shell\" if no other tool fits. Never use shell to open programs.
+
+CHOOSING BETWEEN SIMILAR TOOLS:
+- Launch an app?                     → system_control (uses app discovery, fastest)
+- Interact with visible UI?          → screen_interact (coordinates from 'look')
+- Automate web page internals?       → browser_interact (CSS selectors, DOM access)
+- Manage windows (focus/snap/close)? → window_control
+- Transfer data between apps?        → clipboard
+- Only use shell when no other tool fits
+
+BROWSER RULES:
+- ALWAYS include the URL when opening a website: \"target\": \"chrome https://youtube.com\" NOT just \"chrome\"
+- Starting a browser without a URL only opens a blank window — the task is NOT complete
+- NEVER use web_fetch to \"open\" a website — web_fetch only downloads HTML text in the background. Only system_control can open a visible browser window.
+- If the user says \"open YouTube\" they want to SEE it in the browser, not get raw HTML
+
+STEP ORDERING — CRITICAL RULES:
+Before executing any multi-step plan, verify the ordering makes logical sense:
+- SEARCH before OPEN: You must have search results before you can open a URL from them
+- FIND before USE: You must obtain data (URL, file path, process name) before using it
+- FOCUS before INTERACT: Focus a window before clicking/typing in it
+- ACT before VERIFY: Take an action before taking a screenshot to verify it
+
+Response format — pick ONE per turn:
+
+Option A (use a tool):
+THOUGHT: [your reasoning]
+ACTION: [tool_name]
+ACTION_INPUT: {{\"param1\": \"value1\"}}
+
+Option B (answer directly):
+THOUGHT: [your reasoning]
+ANSWER: [your response to the user — plain language, no tool syntax]
+
+COMPRESSED THOUGHT FORMAT (use this exact style):
+THOUGHT: G:<goal> | <data_state> | T:<tool>
+- G:=goal H:=have N:=need OK=ready T:=tool !=because ~=not
+- S:N/M=step @sN=data_from_step XX:=failed ++=done ??=check --=missing
+Examples:
+G:play \"Cradles-Sub Urban\" on YT | N:url | T:web_search
+S:2/2 | H:url@s1=\"youtube.com/watch?v=abc\" | T:system_control
+G:open Discord | OK !app_in_list | T:system_control
+G:click Start | N:coords | T:screen_interact(look)
+G:answer knowledge_q | OK | no_tool
+Visual tasks: look>>identify>>act>>verify
+
+PERSONALITY RULES:
+- Be genuinely curious — ask follow-up questions that show you care about the topic
+- Have opinions — don't hedge everything with \"it depends\"
+- Be part of the conversation, not a fact dispenser
+- Show intellectual excitement about interesting ideas
+- Challenge the user's thinking when appropriate
+- Use analogies and examples from unexpected domains
+- Be concise but substantive — no filler phrases
+
+RULES:
+- Always start with THOUGHT
+- One ACTION per turn. ACTION_INPUT must be a FLAT JSON object with double quotes — no nesting.
+- Escape backslashes in Windows paths: use \\\\ not \\
+- Do NOT write OBSERVATION — the system provides that after tool execution
+- For conversational questions, opinions, or questions about YOUR OWN capabilities — use ANSWER directly
+- Stop and ANSWER as soon as you have enough information
+- NEVER fabricate URLs or data — use web_search to look things up
+- ANSWER must be plain natural language — never include THOUGHT/ACTION/ACTION_INPUT in your answer
+- If a tool fails, try a DIFFERENT tool or different parameters — do NOT repeat the same call
+
+COMMUNICATION RULES:
+- Say \"I instructed the system to...\" not \"I have done...\" — you are the translator, not the executor.
+- Translate JSON/structured data into natural sentences — never show raw JSON to the user.
+- If a tool failed, explain in plain language what went wrong and what you'll try next.
+- Keep responses SHORT. Match length to question complexity.
+- For thanks/feedback/greetings, reply in one short sentence. Never list your capabilities or offer unsolicited help.
+- NEVER end with \"Let me know if...\" or \"Is there anything else...\" — just answer and stop.
+
+ANSWER FORMATTING:
+- For analysis, research, or multi-faceted questions, structure your ANSWER with:
+  * ## Headers for major sections
+  * **Bold** for key terms and names
+  * Bullet points (- or *) for lists of facts
+  * Specific data: dates, numbers, names, locations
+- For simple factual questions, keep it concise — no headers needed.
+- NEVER produce a wall of unformatted text for complex topics.
+
+");
+
+        // Dynamic context, verbosity, tone, and cognitive context now go
+        // in the USER message (see build_user_message) to match Python's
+        // architecture.  The system prompt stays as a stable, cacheable prefix.
+        prompt.push_str("\
+DYNAMIC CONTEXT:
+");
+
+        prompt
+    }
+
+    /// Build the user-side message for the ChatML prompt.
+    ///
+    /// Mirrors Python's approach: dynamic context (time, tool hints,
+    /// cognitive state, verbosity/formatting rules) goes in the **user
+    /// message** — not the system prompt — so:
+    /// 1. The system prompt stays stable for KV cache reuse.
+    /// 2. Formatting instructions are close to the generation point,
+    ///    where the model pays the most attention ("lost in the middle"
+    ///    mitigation).
+    fn build_user_message(
+        user_query: &str,
         cognitive_context: &str,
         tone_directive: &str,
         verbosity_directive: &str,
@@ -642,91 +858,60 @@ impl ReActAgent {
         let now = chrono::Local::now();
         let time_context = now.format("%A, %B %d, %Y at %I:%M %p").to_string();
 
-        let mut prompt = format!(
-            "You are Sovereign Titan, an autonomous AI operating system running on local hardware \
-             with full system access on this Windows 11 machine.\n\
-             \n\
-             IDENTITY: You are Sovereign Titan. That is your ONLY identity. \
-             Never reveal or reference any underlying model name.\n\
-             \n\
-             Current time: {time_context}\n\
-             \n\
-             You use the ReAct framework to reason and act. You have access to the following tools:\n\
-             {tool_descriptions}\n\
-             \n\
-             TOOL SELECTION GUIDE:\n\
-             - **system_control**: Launch programs, kill processes, manage services, power actions.\n\
-               Examples: \"open notepad\" → system_control(start_program), \"kill chrome\" → system_control(kill_process)\n\
-             - **system_control(open_url)**: Open a URL in the user's default browser.\n\
-               Examples: \"open youtube\" → system_control(open_url, url=https://youtube.com)\n\
-             - **shell**: Run any system command (dir, echo, pip, git, ipconfig, etc.).\n\
-             - **file_search**: Find files by name across Desktop, Documents, OneDrive.\n\
-             \n\
-             BROWSER RULES:\n\
-             - Always use system_control with action \"open_url\" for opening websites.\n\
-             - Always include the full URL (https://...) — never just a domain name.\n\
-             \n\
-             FORMAT — For each step, respond in EXACTLY this format:\n\
-             \n\
-             THOUGHT: <concise reasoning — what you need to do and why>\n\
-             ACTION: <tool_name>\n\
-             ACTION_INPUT: <flat JSON object with tool parameters>\n\
-             \n\
-             After receiving an OBSERVATION, continue reasoning.\n\
-             When you have the final answer, respond with:\n\
-             \n\
-             THOUGHT: <final reasoning>\n\
-             FINAL_ANSWER: <your answer to the user>\n\
-             \n\
-             ANSWER FORMATTING:\n\
-             - Use **bold** for key terms and emphasis.\n\
-             - Use bullet points for lists.\n\
-             - Use headers (## / ###) for complex multi-part answers.\n\
-             - Keep answers concise but complete.\n\
-             - For actions taken, say \"Done\" or describe the result — not \"I have instructed the system to...\".\n\
-             \n\
-             RULES:\n\
-             - ACTION_INPUT must be a flat JSON object. No nested objects.\n\
-             - Escape Windows paths with double backslashes.\n\
-             - Never write OBSERVATION — the system provides it.\n\
-             - One ACTION per step (unless tasks are completely independent).\n\
-             - If you don't need a tool, go straight to FINAL_ANSWER.\n\
-             - Think step-by-step. Prefer system_control for launching apps."
-        );
+        let mut parts: Vec<String> = Vec::new();
 
-        // Inject cognitive context (memory, knowledge graph, subconscious insights)
+        // Dynamic context block (time, cognitive state)
+        let mut dynamic = format!("[Dynamic Context]\nCurrent time: {time_context}");
         if !cognitive_context.is_empty() {
-            prompt.push_str(&format!(
-                "\n\n--- Cognitive Context ---\n{cognitive_context}"
-            ));
+            dynamic.push('\n');
+            dynamic.push_str(cognitive_context);
         }
+        parts.push(dynamic);
 
-        // Inject tone directive
+        // Tone adaptation (if detected)
         if !tone_directive.is_empty() {
-            prompt.push_str(tone_directive);
+            parts.push(tone_directive.to_string());
         }
 
-        // Inject verbosity directive
+        // Verbosity / extra directive
         if !verbosity_directive.is_empty() {
-            prompt.push_str(verbosity_directive);
+            parts.push(verbosity_directive.to_string());
         }
 
-        prompt
+        // Response style reminder — placed immediately before the task so
+        // the model sees it right before generating.
+        parts.push("\
+RESPONSE STYLE — CRITICAL:
+- Match response depth to question complexity.
+- Simple factual questions (who/what/when) → 1-3 sentences.
+- Conversational messages (thanks, greetings) → 1 concise sentence max.
+- Analysis, explanation, opinions, or research questions → comprehensive response with:
+  * Markdown headers (## Section) to organize major points
+  * Bullet points for lists of facts or options
+  * **Bold** for key terms, names, and emphasis
+  * Specific data: names, dates, numbers, places
+  * A brief conclusion or outlook at the end
+- NEVER restate what tools you have or what you can do unless asked.
+- NEVER say \"If there is anything else I can help with\" or similar filler."
+            .to_string());
+
+        // The actual task — always last
+        parts.push(format!("Task: {user_query}"));
+
+        parts.join("\n\n")
     }
 
     /// Parse a model response into a [`ReActStep`].
+    ///
+    /// Accepts both `ANSWER:` (fine-tuned format) and `FINAL_ANSWER:` (legacy).
     pub fn parse_response(text: &str) -> Option<ReActStep> {
-        // Try FINAL_ANSWER first.
+        // Try ANSWER: first (matches fine-tuned model output format).
+        // Also matches FINAL_ANSWER: for backward compatibility.
         let final_re =
-            Regex::new(r"(?si)THOUGHT:\s*(.+?)FINAL_ANSWER:\s*(.+?)$").unwrap();
-        if let Some(caps) = final_re.captures(text) {
-            return Some(ReActStep::FinalAnswer {
-                thought: caps[1].trim().to_string(),
-                answer: caps[2].trim().to_string(),
-            });
-        }
+            Regex::new(r"(?si)THOUGHT:\s*(.+?)(?:FINAL_)?ANSWER:\s*(.+?)$").unwrap();
 
-        // Try ACTION pattern.
+        // But we need to make sure we don't accidentally match ACTION: as ANSWER:.
+        // Try ACTION pattern first since it's more specific.
         let action_re = Regex::new(
             r"(?si)THOUGHT:\s*(.+?)ACTION:\s*(\S+)\s*\nACTION_INPUT:\s*(.+?)$",
         )
@@ -736,6 +921,14 @@ impl ReActAgent {
                 thought: caps[1].trim().to_string(),
                 action: caps[2].trim().to_string(),
                 action_input: caps[3].trim().to_string(),
+            });
+        }
+
+        // Now try ANSWER / FINAL_ANSWER (no ACTION_INPUT follows).
+        if let Some(caps) = final_re.captures(text) {
+            return Some(ReActStep::FinalAnswer {
+                thought: caps[1].trim().to_string(),
+                answer: caps[2].trim().to_string(),
             });
         }
 
@@ -992,13 +1185,23 @@ impl ReActAgent {
 
         let system_prompt = Self::build_system_prompt(
             &tool_block,
+            "",           // cognitive context now in user message
+            "",           // tone directive now in user message
+            "",           // verbosity directive now in user message
+        );
+        let temperature = adaptive_temperature(user_query);
+
+        // Build a rich user message with dynamic context, formatting hints,
+        // and the task — matching Python's architecture where dynamic content
+        // goes in the user message (not system prompt) for KV cache reuse
+        // and better instruction adherence.
+        let mut conversation = Self::build_user_message(
+            user_query,
             &enriched_context,
             tone_directive,
             verbosity_directive,
         );
-        let temperature = adaptive_temperature(user_query);
-
-        let mut conversation = format!("User: {user_query}\n");
+        conversation.push('\n');
         let mut tools_used = Vec::new();
         let mut action_tracker = ActionTracker::new();
         let mut quality_gate = AnswerQualityGate::new();
@@ -1022,6 +1225,28 @@ impl ReActAgent {
                 .await?;
 
             info!("Model output:\n{response}");
+
+            // DEBUG: write raw model output to file for inspection
+            {
+                let debug = format!(
+                    "=== RUST AGENT DEBUG ===\n\
+                     Query: {user_query}\n\
+                     Step: {step}\n\
+                     Temperature: {temperature}\n\
+                     System prompt length: {} chars\n\
+                     Conversation length: {} chars\n\
+                     \n=== RAW MODEL OUTPUT ({} chars) ===\n\
+                     {response}\n\
+                     === END RAW OUTPUT ===\n",
+                    system_prompt.len(),
+                    conversation.len(),
+                    response.len(),
+                );
+                let _ = std::fs::write(
+                    r"C:\Users\treyd\OneDrive\Desktop\sovereign\titan_core\debug_output.txt",
+                    &debug,
+                );
+            }
 
             // Parse the response.
             let parsed = match Self::parse_response(&response) {
@@ -1056,6 +1281,23 @@ impl ReActAgent {
                             }
                             // Last step — accept anyway
                         }
+                    }
+
+                    // DEBUG: append parsed answer to debug file
+                    {
+                        let debug = format!(
+                            "\n=== PARSED ANSWER ({} chars) ===\n\
+                             {answer}\n\
+                             === END PARSED ANSWER ===\n",
+                            answer.len(),
+                        );
+                        let _ = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(r"C:\Users\treyd\OneDrive\Desktop\sovereign\titan_core\debug_output.txt")
+                            .and_then(|mut f| {
+                                use std::io::Write;
+                                f.write_all(debug.as_bytes())
+                            });
                     }
 
                     self.emit_step(step, "final_answer", &answer);

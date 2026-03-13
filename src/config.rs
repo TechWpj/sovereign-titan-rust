@@ -103,6 +103,7 @@ pub struct TitanConfig {
     pub tool_memory_enabled: bool,
     pub fast_paths_enabled: bool,
     pub verbosity_mode: String,
+    pub metacognition_enabled: bool,
 
     // ── Server ───────────────────────────────────────────────────────────
     pub api_host: String,
@@ -187,6 +188,7 @@ impl TitanConfig {
             tool_memory_enabled: env_bool("TITAN_TOOL_MEMORY_ENABLED", true),
             fast_paths_enabled: env_bool("TITAN_FAST_PATHS_ENABLED", true),
             verbosity_mode: env_or("TITAN_VERBOSITY_MODE", "assistant"),
+            metacognition_enabled: env_bool("TITAN_METACOGNITION_ENABLED", true),
 
             // ── Server ──────────────────────────────────────────────────
             api_host: env_or("TITAN_API_HOST", "127.0.0.1"),

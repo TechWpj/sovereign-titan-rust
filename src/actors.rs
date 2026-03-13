@@ -54,12 +54,14 @@ pub async fn prime_actor(
     tool_registry: ToolRegistry,
     app_handle: Option<AppHandle>,
     app_discovery: Option<Arc<std::sync::Mutex<AppDiscovery>>>,
+    metacognition_enabled: bool,
 ) {
-    info!("Prime actor started (ReAct-enabled)");
+    info!("Prime actor started (ReAct-enabled, metacognition={})", metacognition_enabled);
 
     // Build the ReAct agent with tools, optional Tauri handle, and AppDiscovery.
     let agent = {
-        let mut a = ReActAgent::new(Arc::clone(&nexus), tool_registry);
+        let mut a = ReActAgent::new(Arc::clone(&nexus), tool_registry)
+            .with_metacognition(metacognition_enabled);
         if let Some(ref handle) = app_handle {
             a = a.with_app_handle(handle.clone());
         }

@@ -26,9 +26,13 @@ use crate::config::{ModelDescriptor, TitanConfig};
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A loaded model + its context, protected for concurrent access.
+///
+/// IMPORTANT: `ctx` is declared before `model` so it drops first.
+/// `LlamaContext` holds an internal pointer to `LlamaModel`'s C struct,
+/// so the context must be freed before the model.
 struct ModelSlot {
-    model: LlamaModel,
     ctx: LlamaContext<'static>,
+    model: LlamaModel,
 }
 
 // SAFETY: LlamaModel and LlamaContext are Send+Sync per llama-cpp-2 docs.
@@ -135,6 +139,7 @@ impl ModelNexus {
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(Some(n_ctx))
+            .with_n_batch(descriptor.context_length)
             .with_n_threads(config.threads as i32)
             .with_n_threads_batch(config.threads_batch as i32)
             .with_n_ubatch(config.n_ubatch)
@@ -152,7 +157,7 @@ impl ModelNexus {
 
         info!("{label}: loaded successfully ({} params)", model.n_params());
 
-        Ok(ModelSlot { model, ctx })
+        Ok(ModelSlot { ctx, model })
     }
 
     // ── Public loaders ───────────────────────────────────────────────────
@@ -304,81 +309,106 @@ impl ModelNexus {
         // Move into a blocking task — llama.cpp inference is CPU/GPU-bound.
         let prompt = prompt.to_string();
         tokio::task::spawn_blocking(move || {
-            let mut guard = slot.blocking_write();
-            let ModelSlot {
-                ref model,
-                ref mut ctx,
-            } = *guard;
+            // Catch any panics from llama-cpp (debug assertions, etc.)
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut guard = slot.blocking_write();
+                let ModelSlot {
+                    ref mut ctx,
+                    ref model,
+                } = *guard;
 
-            // Clear KV cache to avoid stale state from previous generations.
-            ctx.clear_kv_cache();
+                // Clear KV cache to avoid stale state from previous generations.
+                ctx.clear_kv_cache();
 
-            // Tokenize — no BOS since ChatML provides its own framing.
-            let tokens = model
-                .str_to_token(&prompt, AddBos::Never)
-                .map_err(|e| anyhow::anyhow!("tokenization failed: {e:?}"))?;
+                // Tokenize — no BOS since ChatML provides its own framing.
+                let tokens = model
+                    .str_to_token(&prompt, AddBos::Never)
+                    .map_err(|e| anyhow::anyhow!("tokenization failed: {e:?}"))?;
 
-            anyhow::ensure!(!tokens.is_empty(), "tokenization produced 0 tokens");
+                anyhow::ensure!(!tokens.is_empty(), "tokenization produced 0 tokens");
 
-            // Feed prompt tokens via batch
-            let mut batch = LlamaBatch::new(tokens.len(), 1);
-            for (i, &tok) in tokens.iter().enumerate() {
-                let is_last = i == tokens.len() - 1;
-                batch
-                    .add(tok, i as i32, &[0], is_last)
-                    .map_err(|e| anyhow::anyhow!("batch add failed: {e:?}"))?;
-            }
-
-            ctx.decode(&mut batch)
-                .map_err(|e| anyhow::anyhow!("prompt decode failed: {e:?}"))?;
-
-            // Build sampler chain
-            let sampler = if temperature <= 0.0 {
-                LlamaSampler::greedy()
-            } else {
-                LlamaSampler::chain(
-                    [LlamaSampler::temp(temperature), LlamaSampler::dist(42)],
-                    false,
-                )
-            };
-            let mut sampler = sampler;
-
-            // Autoregressive generation
-            let eos = model.token_eos();
-            let mut output_tokens: Vec<LlamaToken> = Vec::new();
-            let mut n_decoded = tokens.len() as i32;
-
-            for _ in 0..max_tokens {
-                let new_token = sampler.sample(ctx, -1);
-                sampler.accept(new_token);
-
-                if new_token == eos {
-                    break;
+                // Feed prompt tokens via batch
+                let mut batch = LlamaBatch::new(tokens.len(), 1);
+                for (i, &tok) in tokens.iter().enumerate() {
+                    let is_last = i == tokens.len() - 1;
+                    batch
+                        .add(tok, i as i32, &[0], is_last)
+                        .map_err(|e| anyhow::anyhow!("batch add failed: {e:?}"))?;
                 }
 
-                output_tokens.push(new_token);
+                ctx.decode(&mut batch)
+                    .map_err(|e| anyhow::anyhow!("prompt decode failed: {e:?}"))?;
 
-                // Prepare next batch (single token)
-                let mut next_batch = LlamaBatch::new(1, 1);
-                next_batch
-                    .add(new_token, n_decoded, &[0], true)
-                    .map_err(|e| anyhow::anyhow!("next batch failed: {e:?}"))?;
-                ctx.decode(&mut next_batch)
-                    .map_err(|e| anyhow::anyhow!("decode step failed: {e:?}"))?;
-                n_decoded += 1;
+                // Build sampler chain — match Python's llama-cpp-python defaults:
+                // penalties(repeat=1.2) → top_k(40) → top_p(0.9) → min_p(0.05) → temp → dist
+                let seed: u32 = rand::random();
+                let mut sampler = if temperature <= 0.0 {
+                    LlamaSampler::greedy()
+                } else {
+                    LlamaSampler::chain(
+                        [
+                            LlamaSampler::penalties(64, 1.2, 0.0, 0.0),
+                            LlamaSampler::top_k(40),
+                            LlamaSampler::top_p(0.9, 1),
+                            LlamaSampler::min_p(0.05, 1),
+                            LlamaSampler::temp(temperature),
+                            LlamaSampler::dist(seed),
+                        ],
+                        false,
+                    )
+                };
+
+                // Autoregressive generation
+                let eos = model.token_eos();
+                let mut output_tokens: Vec<LlamaToken> = Vec::new();
+                let mut n_decoded = tokens.len() as i32;
+
+                for _ in 0..max_tokens {
+                    let new_token = sampler.sample(ctx, -1);
+                    sampler.accept(new_token);
+
+                    if new_token == eos {
+                        break;
+                    }
+
+                    output_tokens.push(new_token);
+
+                    // Prepare next batch (single token)
+                    let mut next_batch = LlamaBatch::new(1, 1);
+                    next_batch
+                        .add(new_token, n_decoded, &[0], true)
+                        .map_err(|e| anyhow::anyhow!("next batch failed: {e:?}"))?;
+                    ctx.decode(&mut next_batch)
+                        .map_err(|e| anyhow::anyhow!("decode step failed: {e:?}"))?;
+                    n_decoded += 1;
+                }
+
+                // Detokenize
+                let mut decoder = encoding_rs::UTF_8.new_decoder();
+                let mut output = String::new();
+                for tok in &output_tokens {
+                    let piece = model
+                        .token_to_piece(*tok, &mut decoder, false, None)
+                        .unwrap_or_default();
+                    output.push_str(&piece);
+                }
+
+                Ok(output)
+            }));
+
+            match result {
+                Ok(inner) => inner,
+                Err(panic_info) => {
+                    let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "unknown panic in llama-cpp inference".to_string()
+                    };
+                    Err(anyhow::anyhow!("Inference panic caught: {msg}"))
+                }
             }
-
-            // Detokenize
-            let mut decoder = encoding_rs::UTF_8.new_decoder();
-            let mut output = String::new();
-            for tok in &output_tokens {
-                let piece = model
-                    .token_to_piece(*tok, &mut decoder, false, None)
-                    .unwrap_or_default();
-                output.push_str(&piece);
-            }
-
-            Ok(output)
         })
         .await?
     }
@@ -399,8 +429,7 @@ impl ModelNexus {
     ) -> Result<String> {
         let stop_sequences: Vec<String> = vec![
             "\nOBSERVATION:".to_string(),
-            "\nOBSERVATION :".to_string(),
-            "<|im_end|>".to_string(),
+            "\nOBSERVATION".to_string(),
         ];
 
         let prompt = format!(
@@ -409,8 +438,30 @@ impl ModelNexus {
              <|im_start|>assistant\n"
         );
 
-        self.generate_with_stops(&prompt, target, max_tokens, temperature, &stop_sequences)
-            .await
+        info!(
+            "[generate_with_system] system_prompt={} chars, user_message={} chars, \
+             total_chatml={} chars, temp={}, max_tokens={}",
+            system_prompt.len(),
+            user_message.len(),
+            prompt.len(),
+            temperature,
+            max_tokens,
+        );
+        info!(
+            "[generate_with_system] user_message:\n{}",
+            user_message,
+        );
+
+        let result = self
+            .generate_with_stops(&prompt, target, max_tokens, temperature, &stop_sequences)
+            .await?;
+
+        info!(
+            "[generate_with_system] output={} chars:\n{}",
+            result.len(),
+            &result,
+        );
+        Ok(result)
     }
 
     /// Generate a text completion with optional stop sequences.
@@ -431,94 +482,119 @@ impl ModelNexus {
         let stops = stop_sequences.to_vec();
 
         tokio::task::spawn_blocking(move || {
-            let mut guard = slot.blocking_write();
-            let ModelSlot {
-                ref model,
-                ref mut ctx,
-            } = *guard;
+            // Catch any panics from llama-cpp (debug assertions, etc.)
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut guard = slot.blocking_write();
+                let ModelSlot {
+                    ref mut ctx,
+                    ref model,
+                } = *guard;
 
-            // Clear KV cache to avoid stale state from previous generations.
-            ctx.clear_kv_cache();
+                // Clear KV cache to avoid stale state from previous generations.
+                ctx.clear_kv_cache();
 
-            // Tokenize — no BOS since ChatML provides its own framing.
-            let tokens = model
-                .str_to_token(&prompt, AddBos::Never)
-                .map_err(|e| anyhow::anyhow!("tokenization failed: {e:?}"))?;
+                // Tokenize — no BOS since ChatML provides its own framing.
+                let tokens = model
+                    .str_to_token(&prompt, AddBos::Never)
+                    .map_err(|e| anyhow::anyhow!("tokenization failed: {e:?}"))?;
 
-            anyhow::ensure!(!tokens.is_empty(), "tokenization produced 0 tokens");
+                anyhow::ensure!(!tokens.is_empty(), "tokenization produced 0 tokens");
 
-            // Feed prompt tokens via batch
-            let mut batch = LlamaBatch::new(tokens.len(), 1);
-            for (i, &tok) in tokens.iter().enumerate() {
-                let is_last = i == tokens.len() - 1;
-                batch
-                    .add(tok, i as i32, &[0], is_last)
-                    .map_err(|e| anyhow::anyhow!("batch add failed: {e:?}"))?;
-            }
-
-            ctx.decode(&mut batch)
-                .map_err(|e| anyhow::anyhow!("prompt decode failed: {e:?}"))?;
-
-            // Build sampler chain
-            let sampler = if temperature <= 0.0 {
-                LlamaSampler::greedy()
-            } else {
-                LlamaSampler::chain(
-                    [LlamaSampler::temp(temperature), LlamaSampler::dist(42)],
-                    false,
-                )
-            };
-            let mut sampler = sampler;
-
-            // Autoregressive generation with stop sequence detection
-            let eos = model.token_eos();
-            let mut output_tokens: Vec<LlamaToken> = Vec::new();
-            let mut n_decoded = tokens.len() as i32;
-            let mut decoder = encoding_rs::UTF_8.new_decoder();
-            let mut output = String::new();
-            let mut stopped = false;
-
-            for _ in 0..max_tokens {
-                let new_token = sampler.sample(ctx, -1);
-                sampler.accept(new_token);
-
-                if new_token == eos {
-                    break;
+                // Feed prompt tokens via batch
+                let mut batch = LlamaBatch::new(tokens.len(), 1);
+                for (i, &tok) in tokens.iter().enumerate() {
+                    let is_last = i == tokens.len() - 1;
+                    batch
+                        .add(tok, i as i32, &[0], is_last)
+                        .map_err(|e| anyhow::anyhow!("batch add failed: {e:?}"))?;
                 }
 
-                output_tokens.push(new_token);
+                ctx.decode(&mut batch)
+                    .map_err(|e| anyhow::anyhow!("prompt decode failed: {e:?}"))?;
 
-                // Decode incrementally for stop sequence checking
-                let piece = model
-                    .token_to_piece(new_token, &mut decoder, false, None)
-                    .unwrap_or_default();
-                output.push_str(&piece);
+                // Build sampler chain — match Python's llama-cpp-python defaults:
+                // penalties(repeat=1.2) → top_k(40) → top_p(0.9) → min_p(0.05) → temp → dist
+                let seed: u32 = rand::random();
+                let mut sampler = if temperature <= 0.0 {
+                    LlamaSampler::greedy()
+                } else {
+                    LlamaSampler::chain(
+                        [
+                            LlamaSampler::penalties(64, 1.2, 0.0, 0.0),
+                            LlamaSampler::top_k(40),
+                            LlamaSampler::top_p(0.9, 1),
+                            LlamaSampler::min_p(0.05, 1),
+                            LlamaSampler::temp(temperature),
+                            LlamaSampler::dist(seed),
+                        ],
+                        false,
+                    )
+                };
 
-                // Check stop sequences against the accumulated output
-                for stop in &stops {
-                    if output.ends_with(stop.as_str()) {
-                        // Trim the stop sequence from output
-                        let trimmed_len = output.len() - stop.len();
-                        output.truncate(trimmed_len);
-                        stopped = true;
+                // Autoregressive generation with stop sequence detection
+                let eos = model.token_eos();
+                let mut output_tokens: Vec<LlamaToken> = Vec::new();
+                let mut n_decoded = tokens.len() as i32;
+                let mut decoder = encoding_rs::UTF_8.new_decoder();
+                let mut output = String::new();
+                let mut stopped = false;
+
+                for _ in 0..max_tokens {
+                    let new_token = sampler.sample(ctx, -1);
+                    sampler.accept(new_token);
+
+                    if new_token == eos {
                         break;
                     }
-                }
-                if stopped {
-                    break;
+
+                    output_tokens.push(new_token);
+
+                    // Decode incrementally for stop sequence checking
+                    let piece = model
+                        .token_to_piece(new_token, &mut decoder, false, None)
+                        .unwrap_or_default();
+                    output.push_str(&piece);
+
+                    // Check stop sequences against the accumulated output
+                    for stop in &stops {
+                        if output.ends_with(stop.as_str()) {
+                            // Trim the stop sequence from output
+                            let trimmed_len = output.len() - stop.len();
+                            output.truncate(trimmed_len);
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    if stopped {
+                        break;
+                    }
+
+                    // Prepare next batch (single token)
+                    let mut next_batch = LlamaBatch::new(1, 1);
+                    next_batch
+                        .add(new_token, n_decoded, &[0], true)
+                        .map_err(|e| anyhow::anyhow!("next batch failed: {e:?}"))?;
+                    ctx.decode(&mut next_batch)
+                        .map_err(|e| anyhow::anyhow!("decode step failed: {e:?}"))?;
+                    n_decoded += 1;
                 }
 
-                // Prepare next batch (single token)
-                let mut next_batch = LlamaBatch::new(1, 1);
-                next_batch
-                    .add(new_token, n_decoded, &[0], true)
-                    .map_err(|e| anyhow::anyhow!("next batch failed: {e:?}"))?;
-                ctx.decode(&mut next_batch)
-                    .map_err(|e| anyhow::anyhow!("decode step failed: {e:?}"))?;
-                n_decoded += 1;
+                Ok(output)
+            }));
+
+            match result {
+                Ok(inner) => inner,
+                Err(panic_info) => {
+                    let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "unknown panic in llama-cpp inference".to_string()
+                    };
+                    Err(anyhow::anyhow!("Inference panic caught: {msg}"))
+                }
             }
-
-            Ok(output)
         })
         .await?
     }

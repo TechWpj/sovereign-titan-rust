@@ -2,17 +2,37 @@
 
 mod actors;
 mod agent;
+mod api;
+mod autodidactic;
+mod automation;
+mod autonomous;
 mod cognitive;
+mod computer_use;
 mod config;
+mod database;
 mod documents;
+mod email_calendar;
+mod image_gen;
 mod knowledge;
+mod mcp;
 mod memory;
 mod messages;
+mod models;
 mod nexus;
+mod observability;
+mod persona;
+mod physics;
+mod plugins;
 mod routing;
+mod safety;
 mod security;
+mod self_improvement;
+mod sources;
 mod system;
 mod tools;
+mod user;
+mod vision;
+mod voice;
 mod warden;
 mod workflows;
 
@@ -170,12 +190,15 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // ── Spawn Actors ───────────────────────────────────────────────────────
     let prime_handle = handle.clone();
     let prime_discovery = Arc::clone(&app_discovery);
+    let metacognition_enabled = config.metacognition_enabled;
+    info!("Metacognition: {}", if metacognition_enabled { "enabled" } else { "disabled" });
     tauri::async_runtime::spawn(prime_actor(
         Arc::clone(&nexus),
         prime_rx,
         tool_registry,
         Some(prime_handle),
         Some(prime_discovery),
+        metacognition_enabled,
     ));
 
     let mut keep_sub_tx: Option<mpsc::Sender<SubconsciousCommand>> = None;

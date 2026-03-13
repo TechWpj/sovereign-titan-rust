@@ -17,6 +17,14 @@ const NUM_DRAFTS: usize = 3;
 /// Temperature offsets for diversity: [precise, balanced, creative].
 const TEMPERATURE_SPREAD: [f32; NUM_DRAFTS] = [0.3, 0.6, 0.9];
 
+/// Result of multi-draft generation including the system prompt used.
+#[derive(Debug, Clone)]
+pub struct DraftBatch {
+    pub drafts: Vec<Draft>,
+    pub system_prompt: String,
+    pub user_message: String,
+}
+
 /// A single candidate draft with its generation metadata.
 #[derive(Debug, Clone)]
 pub struct Draft {
@@ -92,6 +100,69 @@ impl ThompsonSampler {
                     drafts.push(draft);
                 }
                 Ok(None) => {} // Already logged in the spawn
+                Err(e) => warn!("Thompson: join error: {e}"),
+            }
+        }
+
+        drafts
+    }
+
+    /// Generate [`NUM_DRAFTS`] candidate responses using ChatML system prompt wrapping.
+    ///
+    /// Unlike [`sample_drafts`], this uses `generate_with_system` which applies
+    /// ChatML formatting and stop sequences (`\nOBSERVATION:`), making it
+    /// compatible with the ReAct agent pipeline.
+    pub async fn sample_drafts_with_system(
+        nexus: &Arc<ModelNexus>,
+        system_prompt: &str,
+        user_message: &str,
+        max_tokens: u32,
+        base_temperature: f32,
+    ) -> Vec<Draft> {
+        let mut handles = Vec::with_capacity(NUM_DRAFTS);
+
+        for (i, &offset) in TEMPERATURE_SPREAD.iter().enumerate() {
+            let nexus = Arc::clone(nexus);
+            let sys = system_prompt.to_string();
+            let usr = user_message.to_string();
+
+            // Scale temperature: blend the base with the offset.
+            let temp = (base_temperature * 0.5 + offset * 0.5).clamp(0.1, 1.5);
+
+            let handle = tokio::spawn(async move {
+                let result = nexus
+                    .generate_with_system(&sys, &usr, ModelTarget::Prime, max_tokens, temp)
+                    .await;
+
+                match result {
+                    Ok(text) => Some(Draft {
+                        text,
+                        temperature: temp,
+                        index: i,
+                    }),
+                    Err(e) => {
+                        warn!("Thompson: draft {i} (temp={temp:.2}) failed: {e}");
+                        None
+                    }
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        let mut drafts = Vec::with_capacity(NUM_DRAFTS);
+        for handle in handles {
+            match handle.await {
+                Ok(Some(draft)) => {
+                    info!(
+                        "Thompson: draft {} generated ({} chars, temp={:.2})",
+                        draft.index,
+                        draft.text.len(),
+                        draft.temperature
+                    );
+                    drafts.push(draft);
+                }
+                Ok(None) => {}
                 Err(e) => warn!("Thompson: join error: {e}"),
             }
         }
