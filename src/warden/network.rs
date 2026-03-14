@@ -225,6 +225,21 @@ impl NetworkMonitor {
             });
         }
 
+        // Inbound traffic anomaly — flag if total RX exceeds threshold
+        // (possible C2 beacon download or data staging).
+        const INBOUND_THRESHOLD: u64 = 500 * 1024 * 1024;
+        if total_rx_bytes > INBOUND_THRESHOLD {
+            alerts.push(NetworkAlert {
+                threat_level: "MEDIUM".to_string(),
+                details: format!(
+                    "High inbound traffic detected: {} MB received",
+                    total_rx_bytes / (1024 * 1024)
+                ),
+                remote_addr: None,
+                pid: None,
+            });
+        }
+
         if alerts.is_empty() {
             info!("NDR: scan clean — no threats detected");
         } else {

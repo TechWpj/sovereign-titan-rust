@@ -66,7 +66,8 @@ pub struct PolicyManager {
     /// Policy rules indexed by tool name.
     rules: Vec<PolicyRule>,
     /// Globally blocked command patterns (applied to all tools).
-    global_blocks: Vec<String>,
+    /// Uses `HashSet` for O(1) membership checks.
+    global_blocks: HashSet<String>,
     /// Audit log of recent decisions (tool, action, decision).
     audit_log: Vec<(String, String, String)>,
     /// Maximum audit log entries.
@@ -79,7 +80,7 @@ impl PolicyManager {
         let mut pm = Self {
             clearance,
             rules: Vec::new(),
-            global_blocks: Vec::new(),
+            global_blocks: HashSet::new(),
             audit_log: Vec::new(),
             max_audit: 1000,
         };
@@ -90,7 +91,7 @@ impl PolicyManager {
     /// Load the default security rules.
     fn load_default_rules(&mut self) {
         // ── Global blocks (any tool) ────────────────────────────────────
-        self.global_blocks = vec![
+        self.global_blocks = HashSet::from([
             // Catastrophic file system ops
             "rm -rf /".to_string(),
             "rm -rf /*".to_string(),
@@ -116,7 +117,7 @@ impl PolicyManager {
             "vssadmin delete shadows".to_string(),
             "wmic shadowcopy delete".to_string(),
             "bcdedit /set.*recoveryenabled no".to_string(),
-        ];
+        ]);
 
         // ── Shell tool — most dangerous, requires PowerUser minimum ─────
         self.rules.push(PolicyRule {

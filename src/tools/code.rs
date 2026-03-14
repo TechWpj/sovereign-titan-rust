@@ -76,6 +76,11 @@ fn resolve_path(input: &Value) -> Result<PathBuf, String> {
         return Err("Error: missing 'path' field".into());
     }
 
+    // Validate the raw string is a plausible file path using Path.
+    if !Path::new(raw).has_root() && !raw.starts_with('.') {
+        return Err(format!("Error: path must be absolute or relative (got '{raw}')"));
+    }
+
     let path = PathBuf::from(raw);
 
     // Block system-critical paths.

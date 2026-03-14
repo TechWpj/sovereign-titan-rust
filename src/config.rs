@@ -64,7 +64,7 @@ pub struct TitanConfig {
     // ── Models ───────────────────────────────────────────────────────────
     /// 14B Prime model (GPU-accelerated, main inference).
     pub prime: ModelDescriptor,
-    /// 0.5B Worker model (CPU-only, speculative decoding drafts).
+    /// 0.5B Worker model (GPU, speculative decoding draft for Prime).
     pub worker: ModelDescriptor,
     /// 3B Subconscious model (CPU-only, consciousness / inner monologue).
     pub subconscious: ModelDescriptor,
@@ -126,12 +126,12 @@ impl TitanConfig {
                 context_length: env_u32("TITAN_CONTEXT_LENGTH", 32768),
             },
 
-            // ── Worker (0.5B CPU) ────────────────────────────────────────
+            // ── Worker (0.5B GPU — speculative decoding draft model) ────
             worker: ModelDescriptor {
                 path: std::env::var("TITAN_WORKER_MODEL_PATH").ok(),
                 repo_id: env_or("TITAN_WORKER_MODEL_NAME", "Qwen/Qwen2.5-0.5B-Instruct-GGUF"),
                 filename: env_or("TITAN_WORKER_MODEL_FILE", "qwen2.5-0.5b-instruct-q8_0.gguf"),
-                gpu_layers: 0,
+                gpu_layers: env_i32("TITAN_WORKER_GPU_LAYERS", 0), // CPU-only (Prime uses most VRAM)
                 context_length: env_u32("TITAN_WORKER_CONTEXT_LENGTH", 32768),
             },
 

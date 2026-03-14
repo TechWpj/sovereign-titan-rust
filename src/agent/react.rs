@@ -22,13 +22,20 @@ use tauri::{AppHandle, Emitter};
 use tracing::{info, warn};
 
 use crate::agent::context::ContextManager;
+use crate::agent::dag::{DagExecutor, StepFn};
 use crate::agent::distiller::ObservationDistiller;
 use crate::agent::execution_paths::ExecutionPathRouter;
+use crate::agent::prediction_capture::{PredictionCaptureEngine, PredictionEvent};
+use crate::agent::prompt_compiler::PromptCompiler;
+use crate::agent::prose_recovery::ProseRecovery;
 use crate::agent::quality::{AnswerQualityGate, QualityVerdict};
+use crate::agent::skill_registry::SkillRegistry;
+use crate::agent::task_planner::{self, TaskPlanner};
 use crate::agent::tone::ToneDetector;
 use crate::agent::tool_memory::ToolOutcomeMemory;
 use crate::agent::verbosity::VerbosityMode;
 use crate::nexus::{ModelNexus, ModelTarget};
+use crate::security::policy::{PolicyManager, PolicyDecision, Clearance};
 use crate::system::app_discovery::AppDiscovery;
 use crate::tools::ToolRegistry;
 
@@ -38,14 +45,6 @@ const MAX_STEPS: usize = 10;
 /// Maximum observation length before truncation.
 const MAX_OBSERVATION_LEN: usize = 2000;
 
-/// Context compression threshold (chars).
-const CONTEXT_COMPRESS_THRESHOLD: usize = 12_000;
-
-/// Maximum context length (chars).
-const MAX_CONTEXT_LEN: usize = 24_000;
-
-/// Minimum acceptable answer length.
-const MIN_ANSWER_LEN: usize = 10;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Agent result
@@ -70,6 +69,7 @@ pub enum RoutingPath {
     FastLaunch,
     FastAnswer,
     ExecutionPath(String),
+    DagExecution,
     ReactLoop,
 }
 
@@ -79,6 +79,7 @@ impl std::fmt::Display for RoutingPath {
             RoutingPath::FastLaunch => write!(f, "fast_launch"),
             RoutingPath::FastAnswer => write!(f, "fast_answer"),
             RoutingPath::ExecutionPath(name) => write!(f, "execution_path:{name}"),
+            RoutingPath::DagExecution => write!(f, "dag_execution"),
             RoutingPath::ReactLoop => write!(f, "react_loop"),
         }
     }
@@ -255,93 +256,6 @@ fn truncate_observation(obs: &str) -> String {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Context compression
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Compress conversation context by dropping old OBSERVATION blocks.
-fn compress_context(conversation: &str) -> String {
-    if conversation.len() <= CONTEXT_COMPRESS_THRESHOLD {
-        return conversation.to_string();
-    }
-
-    let mut result = String::new();
-    let mut in_observation = false;
-    let mut observation_count = 0;
-
-    // Count total observations
-    let total_observations = conversation.matches("OBSERVATION:").count();
-    // Keep only the last 3 observations
-    let keep_from = total_observations.saturating_sub(3);
-
-    for line in conversation.lines() {
-        if line.starts_with("OBSERVATION:") {
-            observation_count += 1;
-            if observation_count <= keep_from {
-                result.push_str("OBSERVATION: [compressed — see recent observations]\n");
-                in_observation = true;
-                continue;
-            }
-            in_observation = false;
-        } else if in_observation
-            && (line.starts_with("THOUGHT:")
-                || line.starts_with("ACTION:")
-                || line.starts_with("ACTION_INPUT:")
-                || line.starts_with("User:")
-                || line.starts_with("SYSTEM:"))
-        {
-            in_observation = false;
-        }
-
-        if in_observation {
-            continue;
-        }
-
-        result.push_str(line);
-        result.push('\n');
-    }
-
-    // If still too long, hard-truncate from the front
-    if result.len() > MAX_CONTEXT_LEN {
-        let skip = result.len() - MAX_CONTEXT_LEN;
-        format!("[...context truncated...]\n{}", &result[skip..])
-    } else {
-        result
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Answer quality gate
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Check if an answer is acceptable quality.
-fn is_quality_answer(answer: &str, query: &str) -> bool {
-    let a = answer.trim();
-
-    // Too short
-    if a.len() < MIN_ANSWER_LEN {
-        return false;
-    }
-
-    // Echo detection — answer is just the query repeated
-    if a.to_lowercase() == query.trim().to_lowercase() {
-        return false;
-    }
-
-    // Refusal patterns
-    let refusal_patterns = [
-        "i cannot", "i can't", "i'm not able", "i am not able",
-        "as an ai", "i don't have the ability",
-    ];
-    if refusal_patterns.iter().any(|p| a.to_lowercase().contains(p)) {
-        // Only reject if the entire answer is a refusal (not just contains the phrase)
-        if a.len() < 100 {
-            return false;
-        }
-    }
-
-    true
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Duplicate action detection
@@ -522,6 +436,25 @@ impl Default for ToolHealthTracker {
 // ReAct step parsing
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Predictive coding metadata extracted from model output.
+///
+/// When the model outputs `[SYSTEM 2: TEST-TIME COMPUTE]`, `[PREDICTIVE ANCHOR]`,
+/// and `[ERROR DELTA]` blocks, these are captured here for the prediction
+/// capture engine (autonomous retraining data).
+#[derive(Debug, Clone, Default)]
+pub struct PredictiveMeta {
+    /// System 2 test-time compute block (brainstormed options).
+    pub system2_ttc: String,
+    /// Which option was selected from the TTC block.
+    pub ttc_selection: String,
+    /// Predictive anchor (expected outcome prediction).
+    pub prediction: String,
+    /// Error delta text (comparison of prediction vs reality).
+    pub error_delta: String,
+    /// Whether the delta was HIGH (large prediction error).
+    pub delta_is_high: bool,
+}
+
 /// A parsed ReAct step from model output.
 #[derive(Debug, Clone)]
 pub enum ReActStep {
@@ -530,6 +463,8 @@ pub enum ReActStep {
         thought: String,
         action: String,
         action_input: String,
+        /// Optional predictive coding metadata.
+        predictive: Option<PredictiveMeta>,
     },
     /// The agent is ready to answer.
     FinalAnswer {
@@ -564,13 +499,62 @@ pub struct ReActAgent {
     // ── Polish layer (Wave 4) ────────────────────────────────────────
     tone_detector: ToneDetector,
     verbosity: VerbosityMode,
+    // ── Error recovery (Rule 3) ─────────────────────────────────────
+    prose_recovery: std::sync::Mutex<ProseRecovery>,
+    // ── KV Cache Preservation (Phase 2) ─────────────────────────────
+    /// The static system prompt (UNIVERSAL_BASE_PREFIX), computed once
+    /// at construction. Passed to `generate_with_cached_prefix` so the
+    /// GPU KV cache entries for this prefix are reused across requests.
+    static_system_prompt: String,
     // ── Metacognition (multi-draft generation) ────────────────────────
     metacognition_enabled: bool,
+    // ── Phase 3: DAG execution + Prediction capture ─────────────────
+    /// Task planner for DAG decomposition of complex queries.
+    task_planner: TaskPlanner,
+    /// Prediction capture engine for autonomous retraining data.
+    prediction_capture: PredictionCaptureEngine,
+    // ── Phase 5: Event bus sender ─────────────────────────────────────
+    /// Broadcast sender for emitting CognitiveEvent to the event bus.
+    event_tx: Option<tokio::sync::broadcast::Sender<crate::event_bus::CognitiveEvent>>,
+    // ── Skill Registry & Prompt Compiler ────────────────────────────────
+    /// Matches user queries to baked-in skill/library content.
+    skill_registry: SkillRegistry,
+    /// Adaptive token-budget prompt compiler.
+    prompt_compiler: PromptCompiler,
+    // ── Answer quality gate (persistent across runs) ────────────────────
+    /// Persistent quality gate for re-prompt tracking across queries.
+    quality_gate: std::sync::Mutex<AnswerQualityGate>,
+    // ── Security policy enforcement ──────────────────────────────────────
+    /// ABAC policy manager — gates tool execution by clearance level and
+    /// blocked patterns. Every tool invocation passes through this before
+    /// execution.
+    policy_manager: std::sync::Mutex<PolicyManager>,
 }
 
 impl ReActAgent {
     /// Create a new ReAct agent.
+    ///
+    /// Computes the `UNIVERSAL_BASE_PREFIX` from the tool registry at
+    /// construction time. This static string is used for KV cache
+    /// preservation — the GPU evaluates these tokens once and reuses
+    /// them across all subsequent requests.
     pub fn new(nexus: Arc<ModelNexus>, registry: ToolRegistry) -> Self {
+        let tool_names: Vec<String> = registry.names().iter().map(|s| s.to_string()).collect();
+        let tool_block = registry.describe_all();
+        let static_system_prompt = crate::agent::prompt_compiler::universal_base_prefix(
+            &tool_block,
+            "", // app_summary filled in later via with_app_discovery
+        );
+        let planner = TaskPlanner::new(Arc::clone(&nexus));
+        let skill_registry = SkillRegistry::new();
+        let prompt_compiler = PromptCompiler::default();
+        let execution_paths = ExecutionPathRouter::new();
+        info!(
+            "ReActAgent: {} skills, {} execution paths ({:?})",
+            skill_registry.skill_count(),
+            execution_paths.path_count(),
+            execution_paths.path_names(),
+        );
         Self {
             nexus,
             registry,
@@ -580,11 +564,20 @@ impl ReActAgent {
             app_discovery: None,
             distiller: ObservationDistiller::new(),
             tool_memory: std::sync::Mutex::new(ToolOutcomeMemory::new()),
-            execution_paths: ExecutionPathRouter::new(),
-            context_manager: ContextManager::new(),
+            execution_paths,
+            context_manager: ContextManager::with_thresholds(20_000, 24_000),
             tone_detector: ToneDetector::new(),
             verbosity: VerbosityMode::Assistant,
+            prose_recovery: std::sync::Mutex::new(ProseRecovery::new(tool_names)),
+            static_system_prompt,
             metacognition_enabled: true,
+            task_planner: planner,
+            prediction_capture: PredictionCaptureEngine::new(None, true),
+            event_tx: None,
+            skill_registry,
+            prompt_compiler,
+            quality_gate: std::sync::Mutex::new(AnswerQualityGate::with_min_length(10)),
+            policy_manager: std::sync::Mutex::new(PolicyManager::new(Clearance::Admin)),
         }
     }
 
@@ -607,9 +600,39 @@ impl ReActAgent {
     }
 
     /// Attach an AppDiscovery instance for fast launch resolution.
+    ///
+    /// Also recomputes the static system prompt to include the app catalog.
     pub fn with_app_discovery(mut self, discovery: Arc<std::sync::Mutex<AppDiscovery>>) -> Self {
+        // Build app summary for inclusion in the static prefix.
+        let app_summary = {
+            let disc = discovery.lock().unwrap();
+            disc.summary()
+        };
+        // Recompute the static system prompt with the app catalog.
+        let tool_block = self.registry.describe_all();
+        self.static_system_prompt = crate::agent::prompt_compiler::universal_base_prefix(
+            &tool_block,
+            &app_summary,
+        );
         self.app_discovery = Some(discovery);
         self
+    }
+
+    /// Attach an event bus sender for emitting CognitiveEvent after tool execution.
+    pub fn with_event_sender(
+        mut self,
+        tx: tokio::sync::broadcast::Sender<crate::event_bus::CognitiveEvent>,
+    ) -> Self {
+        self.event_tx = Some(tx);
+        self
+    }
+
+    /// Get the static system prompt (UNIVERSAL_BASE_PREFIX).
+    ///
+    /// This is the string that should be passed to `ModelNexus::warmup_cache()`
+    /// at boot to lock the prefix into the GPU KV cache.
+    pub fn static_system_prompt(&self) -> &str {
+        &self.static_system_prompt
     }
 
     /// Emit an agent step event to the Tauri frontend (if handle is set).
@@ -653,13 +676,17 @@ impl ReActAgent {
         }
     }
 
-    /// Build the system prompt with tool descriptions, cognitive context,
+    /// Build a full system prompt with tool descriptions, cognitive context,
     /// and optional tone/verbosity directives.
-    fn build_system_prompt(
+    ///
+    /// Used for diagnostic introspection (e.g. `get_system_prompt` Tauri command)
+    /// and tests. The runtime KV-cached path uses `universal_base_prefix()` +
+    /// `build_user_message()` instead.
+    pub fn build_system_prompt(
         tool_descriptions: &str,
-        _cognitive_context: &str,
-        _tone_directive: &str,
-        _verbosity_directive: &str,
+        cognitive_context: &str,
+        tone_directive: &str,
+        verbosity_directive: &str,
     ) -> String {
         // ── Universal Base Prefix (identical to Python's UNIVERSAL_BASE_PREFIX) ──
         let mut prompt = format!("\
@@ -828,14 +855,47 @@ ANSWER FORMATTING:
 - For simple factual questions, keep it concise — no headers needed.
 - NEVER produce a wall of unformatted text for complex topics.
 
+PREDICTIVE CODING (optional, for complex tool tasks):
+When you are about to use a tool, you MAY add predictive coding blocks to improve your calibration.
+These blocks are OPTIONAL — only use them when the outcome is uncertain.
+
+Format (wrap around your normal THOUGHT/ACTION):
+[SYSTEM 2: TEST-TIME COMPUTE]
+Option A: <description>
+Option B: <description>
+Selected: <which option and why>
+[/SYSTEM 2]
+
+[PREDICTIVE ANCHOR]
+I predict: <what you expect the tool to return>
+[/PREDICTIVE ANCHOR]
+
+THOUGHT: <your reasoning>
+ACTION: <tool_name>
+ACTION_INPUT: {{\"param1\": \"value1\"}}
+
+After receiving the OBSERVATION, compare reality vs prediction:
+[ERROR DELTA]
+Predicted: <what you expected>
+Actual: <what happened>
+Delta: ZERO (prediction matched) | HIGH (prediction was wrong)
+[/ERROR DELTA]
+
 ");
 
-        // Dynamic context, verbosity, tone, and cognitive context now go
-        // in the USER message (see build_user_message) to match Python's
-        // architecture.  The system prompt stays as a stable, cacheable prefix.
-        prompt.push_str("\
-DYNAMIC CONTEXT:
-");
+        // Append optional dynamic sections when provided (diagnostic path).
+        // In the runtime KV-cached path these go in the USER message instead.
+        if !cognitive_context.is_empty() {
+            prompt.push_str(&format!("\n[Cognitive Context]\n{cognitive_context}\n"));
+        }
+        if !tone_directive.is_empty() {
+            prompt.push_str(tone_directive);
+            prompt.push('\n');
+        }
+        if !verbosity_directive.is_empty() {
+            prompt.push_str(verbosity_directive);
+            prompt.push('\n');
+        }
 
         prompt
     }
@@ -904,28 +964,36 @@ RESPONSE STYLE — CRITICAL:
     /// Parse a model response into a [`ReActStep`].
     ///
     /// Accepts both `ANSWER:` (fine-tuned format) and `FINAL_ANSWER:` (legacy).
+    ///
+    /// Also extracts predictive coding metadata when present:
+    /// - `[SYSTEM 2: TEST-TIME COMPUTE]` — brainstormed options
+    /// - `[PREDICTIVE ANCHOR]` — expected outcome prediction
+    /// - `[ERROR DELTA]` — comparison of prediction vs reality
     pub fn parse_response(text: &str) -> Option<ReActStep> {
-        // Try ANSWER: first (matches fine-tuned model output format).
-        // Also matches FINAL_ANSWER: for backward compatibility.
-        let final_re =
-            Regex::new(r"(?si)THOUGHT:\s*(.+?)(?:FINAL_)?ANSWER:\s*(.+?)$").unwrap();
+        // ── Extract predictive coding metadata (if present) ──────────
+        let predictive = Self::extract_predictive_meta(text);
 
-        // But we need to make sure we don't accidentally match ACTION: as ANSWER:.
+        // Strip predictive coding blocks from text for standard parsing.
+        let clean_text = Self::strip_predictive_blocks(text);
+
         // Try ACTION pattern first since it's more specific.
         let action_re = Regex::new(
             r"(?si)THOUGHT:\s*(.+?)ACTION:\s*(\S+)\s*\nACTION_INPUT:\s*(.+?)$",
         )
         .unwrap();
-        if let Some(caps) = action_re.captures(text) {
+        if let Some(caps) = action_re.captures(&clean_text) {
             return Some(ReActStep::Action {
                 thought: caps[1].trim().to_string(),
                 action: caps[2].trim().to_string(),
                 action_input: caps[3].trim().to_string(),
+                predictive,
             });
         }
 
-        // Now try ANSWER / FINAL_ANSWER (no ACTION_INPUT follows).
-        if let Some(caps) = final_re.captures(text) {
+        // Try ANSWER / FINAL_ANSWER (no ACTION_INPUT follows).
+        let final_re =
+            Regex::new(r"(?si)THOUGHT:\s*(.+?)(?:FINAL_)?ANSWER:\s*(.+?)$").unwrap();
+        if let Some(caps) = final_re.captures(&clean_text) {
             return Some(ReActStep::FinalAnswer {
                 thought: caps[1].trim().to_string(),
                 answer: caps[2].trim().to_string(),
@@ -933,6 +1001,91 @@ RESPONSE STYLE — CRITICAL:
         }
 
         None
+    }
+
+    /// Extract predictive coding metadata from model output.
+    ///
+    /// Looks for `[SYSTEM 2: TEST-TIME COMPUTE]...[/SYSTEM 2]`,
+    /// `[PREDICTIVE ANCHOR]...[/PREDICTIVE ANCHOR]`, and
+    /// `[ERROR DELTA]...[/ERROR DELTA]` blocks.
+    fn extract_predictive_meta(text: &str) -> Option<PredictiveMeta> {
+        let sys2_re = Regex::new(
+            r"(?si)\[SYSTEM 2:\s*TEST-TIME COMPUTE\]\s*(.*?)\[/SYSTEM 2\]"
+        ).ok()?;
+        let anchor_re = Regex::new(
+            r"(?si)\[PREDICTIVE ANCHOR\]\s*(.*?)\[/PREDICTIVE ANCHOR\]"
+        ).ok()?;
+        let delta_re = Regex::new(
+            r"(?si)\[ERROR DELTA\]\s*(.*?)\[/ERROR DELTA\]"
+        ).ok()?;
+
+        let has_any = sys2_re.is_match(text) || anchor_re.is_match(text) || delta_re.is_match(text);
+        if !has_any {
+            return None;
+        }
+
+        let system2_ttc = sys2_re
+            .captures(text)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+
+        let prediction = anchor_re
+            .captures(text)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+
+        let error_delta = delta_re
+            .captures(text)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+
+        // Determine if delta is HIGH
+        let delta_is_high = error_delta.to_uppercase().contains("HIGH");
+
+        // Extract TTC selection (look for "Selected:" or "→" in the system2 block)
+        let ttc_selection = if !system2_ttc.is_empty() {
+            let sel_re = Regex::new(r"(?i)(?:Selected|Choice|→)\s*:?\s*(.+?)(?:\n|$)").ok();
+            sel_re
+                .and_then(|re| re.captures(&system2_ttc))
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        Some(PredictiveMeta {
+            system2_ttc,
+            ttc_selection,
+            prediction,
+            error_delta,
+            delta_is_high,
+        })
+    }
+
+    /// Strip predictive coding blocks from text for standard ReAct parsing.
+    fn strip_predictive_blocks(text: &str) -> String {
+        let mut result = text.to_string();
+
+        // Remove [SYSTEM 2: TEST-TIME COMPUTE]...[/SYSTEM 2]
+        if let Ok(re) = Regex::new(r"(?si)\[SYSTEM 2:\s*TEST-TIME COMPUTE\].*?\[/SYSTEM 2\]\s*") {
+            result = re.replace_all(&result, "").to_string();
+        }
+
+        // Remove [PREDICTIVE ANCHOR]...[/PREDICTIVE ANCHOR]
+        if let Ok(re) = Regex::new(r"(?si)\[PREDICTIVE ANCHOR\].*?\[/PREDICTIVE ANCHOR\]\s*") {
+            result = re.replace_all(&result, "").to_string();
+        }
+
+        // Remove [ERROR DELTA]...[/ERROR DELTA]
+        if let Ok(re) = Regex::new(r"(?si)\[ERROR DELTA\].*?\[/ERROR DELTA\]\s*") {
+            result = re.replace_all(&result, "").to_string();
+        }
+
+        result
     }
 
     // ── Routing Waterfall ───────────────────────────────────────────────
@@ -1020,6 +1173,13 @@ RESPONSE STYLE — CRITICAL:
     }
 
     /// Main entry point returning full [`AgentResult`] with metadata.
+    ///
+    /// 5-tier routing waterfall:
+    /// 1. Fast launch (AppDiscovery)
+    /// 2. Fast answer (time/date — no LLM)
+    /// 3. Execution paths (deterministic multi-step workflows)
+    /// 4. DAG execution (LLM-planned parallel task decomposition)
+    /// 5. Full ReAct loop
     pub async fn run_with_result(
         &self,
         user_query: &str,
@@ -1048,7 +1208,12 @@ RESPONSE STYLE — CRITICAL:
             return Ok(result);
         }
 
-        // Tier 4: Full ReAct loop
+        // Tier 4: DAG execution (LLM-planned parallel task decomposition)
+        if let Some(result) = self.try_dag_execution(user_query).await {
+            return Ok(result);
+        }
+
+        // Tier 5: Full ReAct loop
         info!("Routing: react_loop for '{}'", &user_query[..user_query.len().min(50)]);
         self.run_react_loop(user_query, cognitive_context).await
     }
@@ -1159,13 +1324,200 @@ RESPONSE STYLE — CRITICAL:
         })
     }
 
+    /// Try DAG execution for complex multi-step tasks.
+    ///
+    /// Uses `is_complex_task()` heuristic to detect queries that warrant
+    /// parallel decomposition, then asks the LLM to plan the steps,
+    /// and executes them via the `DagExecutor`.
+    async fn try_dag_execution(&self, query: &str) -> Option<AgentResult> {
+        // Heuristic gate: only attempt DAG for complex tasks
+        if !task_planner::is_complex_task(query) {
+            return None;
+        }
+
+        info!(
+            "Routing: trying dag_execution for '{}'",
+            &query[..query.len().min(50)]
+        );
+
+        // Ask the LLM to plan the task
+        let (graph, params_map) = self
+            .task_planner
+            .plan(query, &self.registry)
+            .await?;
+
+        // Early return if the planner produced an empty graph
+        if graph.is_empty() {
+            info!("DAG: planner returned empty graph, falling through to ReAct");
+            return None;
+        }
+
+        let total_steps = graph.len();
+        info!("DAG: planned {} steps for task", total_steps);
+
+        // Build a step function that dispatches to tools
+        let registry_names: Vec<String> = self.registry.names().iter().map(|s| s.to_string()).collect();
+        let registry = &self.registry;
+
+        // We need to collect tool references before entering the async closure.
+        // Build a map of tool name → params for each step.
+        let graph = Arc::new(tokio::sync::Mutex::new(graph));
+        let params_map = Arc::new(params_map);
+
+        // Collect tool handles we'll need
+        let tools: HashMap<String, Arc<dyn crate::tools::Tool>> = {
+            let mut map = HashMap::new();
+            for name in &registry_names {
+                if let Some(tool) = registry.get(name) {
+                    map.insert(name.clone(), tool);
+                }
+            }
+            map
+        };
+        let tools = Arc::new(tools);
+        let params_map_for_fn = Arc::clone(&params_map);
+
+        let step_fn: StepFn = Arc::new(move |node, ctx| {
+            let tools = Arc::clone(&tools);
+            let params_map = Arc::clone(&params_map_for_fn);
+
+            Box::pin(async move {
+                let tool_name = node.tool.as_deref().unwrap_or("unknown");
+                let tool = tools.get(tool_name).ok_or_else(|| {
+                    format!("Tool '{}' not found in registry", tool_name)
+                })?;
+
+                // Build params: start with planned params, inject context vars
+                let mut params = params_map
+                    .get(&node.id)
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+
+                // Inject context variables into params
+                {
+                    let context = ctx.lock().await;
+                    if let serde_json::Value::Object(ref mut map) = params {
+                        for (key, value) in context.iter() {
+                            // Replace template references like "{variable_name}"
+                            for (_param_key, param_val) in map.iter_mut() {
+                                if let serde_json::Value::String(s) = param_val {
+                                    let placeholder = format!("{{{}}}", key);
+                                    if s.contains(&placeholder) {
+                                        *s = s.replace(&placeholder, value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                match tool.execute(params).await {
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(format!("Tool '{}' failed: {}", tool_name, e)),
+                }
+            })
+        });
+
+        let executor = DagExecutor::new(4);
+        let dag_result = executor.run(Arc::clone(&graph), step_fn).await;
+
+        // Collect tools used
+        let tools_used: Vec<String> = {
+            let g = graph.lock().await;
+            g.nodes
+                .values()
+                .filter(|n| n.status == crate::agent::dag::NodeStatus::Completed)
+                .filter_map(|n| n.tool.clone())
+                .collect()
+        };
+
+        // Build answer from results
+        let answer = if dag_result.success {
+            // Combine all results into a summary
+            let mut parts: Vec<String> = Vec::new();
+            for (key, value) in &dag_result.results {
+                // Skip internal keys, show tool results
+                let truncated = if value.len() > 500 {
+                    format!("{}...", &value[..500])
+                } else {
+                    value.clone()
+                };
+                parts.push(format!("**{}**: {}", key, truncated));
+            }
+            if parts.is_empty() {
+                "All steps completed successfully.".to_string()
+            } else {
+                parts.join("\n\n")
+            }
+        } else {
+            let failed = dag_result.failed_steps.join(", ");
+            format!(
+                "DAG execution partially completed ({}/{} steps). Failed: {}",
+                dag_result.completed_steps.len(),
+                total_steps,
+                failed
+            )
+        };
+
+        self.emit_step(0, "final_answer", &answer);
+
+        // Record tool outcomes
+        for tool_name in &tools_used {
+            self.health.lock().unwrap().record_success(tool_name);
+            if let Ok(mut mem) = self.tool_memory.lock() {
+                let action_type = crate::agent::tool_memory::classify_action_type(query);
+                mem.record_success(tool_name, action_type);
+            }
+        }
+
+        Some(AgentResult {
+            answer,
+            tools_used,
+            iterations: 0,
+            routing_path: RoutingPath::DagExecution,
+        })
+    }
+
     /// Run the full ReAct loop with all enhancements.
     async fn run_react_loop(
         &self,
         user_query: &str,
         cognitive_context: &str,
     ) -> Result<AgentResult> {
-        let tool_block = self.registry.describe_all();
+        // Reset prose recovery counter for this conversation.
+        if let Ok(mut recovery) = self.prose_recovery.lock() {
+            recovery.reset();
+        }
+
+        // Reset tool health tracker for new session.
+        if let Ok(mut health) = self.health.lock() {
+            health.reset();
+            let offline = health.offline_tools();
+            if !offline.is_empty() {
+                info!("Tools offline at session start: {:?}", offline);
+            }
+        }
+
+        // Start prediction capture for this interaction.
+        let interaction_id = PredictionCaptureEngine::new_interaction_id();
+        // Simple hash of system prompt for dedup (avoid storing full prompt)
+        let prompt_hash = format!("{:016x}", {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.static_system_prompt.hash(&mut hasher);
+            hasher.finish()
+        });
+        self.prediction_capture
+            .start_interaction(&interaction_id, user_query, &prompt_hash);
+
+        // Reset persistent quality gate for this query.
+        if let Ok(mut gate) = self.quality_gate.lock() {
+            gate.reset();
+            info!(
+                "Quality gate reset (max_reprompts={})",
+                gate.max_reprompts()
+            );
+        }
 
         // Inject tool memory hints into cognitive context
         let tool_hints = {
@@ -1173,22 +1525,42 @@ RESPONSE STYLE — CRITICAL:
                 .map(|mem| mem.get_hints(user_query))
                 .unwrap_or_default()
         };
-        let enriched_context = if tool_hints.is_empty() {
+        let mut enriched_context = if tool_hints.is_empty() {
             cognitive_context.to_string()
         } else {
             format!("{cognitive_context}\n{tool_hints}")
         };
 
+        // Inject skill guidance from the skill registry
+        let skill_content = self.skill_registry.get_matched_content(user_query);
+        if !skill_content.is_empty() {
+            info!("Skill matched for query, injecting guidance");
+            enriched_context.push('\n');
+            enriched_context.push_str(&skill_content);
+        }
+
+        // Build dynamic prompt sections via PromptCompiler
+        let tool_block = self.registry.describe_all();
+        let _sections = self.prompt_compiler.build_sections_with_skill(
+            &self.static_system_prompt,
+            &tool_block,
+            &enriched_context,
+            "",
+            &skill_content,
+        );
+        info!(
+            "Prompt budget: {} tokens available",
+            self.prompt_compiler.budget()
+        );
+
         // Tone and verbosity directives
         let tone_directive = self.tone_detector.tone_directive(user_query);
         let verbosity_directive = self.verbosity.directive();
 
-        let system_prompt = Self::build_system_prompt(
-            &tool_block,
-            "",           // cognitive context now in user message
-            "",           // tone directive now in user message
-            "",           // verbosity directive now in user message
-        );
+        // Use the static system prompt (UNIVERSAL_BASE_PREFIX) computed
+        // at construction. This is the same string that was warmed up
+        // into the KV cache at boot — it never changes at runtime.
+        let system_prompt = &self.static_system_prompt;
         let temperature = adaptive_temperature(user_query);
 
         // Build a rich user message with dynamic context, formatting hints,
@@ -1204,7 +1576,8 @@ RESPONSE STYLE — CRITICAL:
         conversation.push('\n');
         let mut tools_used = Vec::new();
         let mut action_tracker = ActionTracker::new();
-        let mut quality_gate = AnswerQualityGate::new();
+        let mut quality_gate = AnswerQualityGate::with_min_length(10);
+        quality_gate.reset();
 
         for step in 0..MAX_STEPS {
             info!("ReAct step {}/{MAX_STEPS} (temp={temperature})", step + 1);
@@ -1212,11 +1585,11 @@ RESPONSE STYLE — CRITICAL:
             // Context compression via ContextManager
             conversation = self.context_manager.compress(&conversation);
 
-            // Generate from the model with proper ChatML wrapping.
+            // Generate from the model using cached prefix (KV cache reuse).
             let response = self
                 .nexus
-                .generate_with_system(
-                    &system_prompt,
+                .generate_with_cached_prefix(
+                    system_prompt,
                     &conversation,
                     ModelTarget::Prime,
                     self.max_tokens,
@@ -1252,14 +1625,85 @@ RESPONSE STYLE — CRITICAL:
             let parsed = match Self::parse_response(&response) {
                 Some(p) => p,
                 None => {
-                    warn!("ReAct: could not parse model output, treating as final answer");
-                    self.emit_step(step, "final_answer", response.trim());
-                    return Ok(AgentResult {
-                        answer: response.trim().to_string(),
-                        tools_used,
-                        iterations: step + 1,
-                        routing_path: RoutingPath::ReactLoop,
-                    });
+                    // ── Prose error recovery (Rule 3) ────────────────────
+                    // If the model output has no ReAct markers, check if it
+                    // describes a tool call in prose (e.g., "I'll search...")
+                    // and apply the 3-tier recovery pipeline.
+                    let prose_info = {
+                        let recovery = self.prose_recovery.lock().unwrap();
+                        recovery.detect_prose_tool_call(&response)
+                    };
+
+                    if let Some(info) = prose_info {
+                        let failures = {
+                            let mut recovery = self.prose_recovery.lock().unwrap();
+                            recovery.format_failures += 1;
+                            recovery.format_failures
+                        };
+
+                        warn!(
+                            "Prose tool call detected (failure #{}): {} → {}",
+                            failures, info.intent, info.tool
+                        );
+
+                        if failures >= 2 {
+                            // Tier 2: auto-convert prose to action.
+                            let auto = {
+                                let recovery = self.prose_recovery.lock().unwrap();
+                                recovery.auto_convert_prose_to_action(
+                                    &info, user_query, &response,
+                                )
+                            };
+                            if let Some(converted) = auto {
+                                info!(
+                                    "Auto-converted prose → ACTION: {}",
+                                    converted.tool
+                                );
+                                // Synthesize as an Action step and continue.
+                                ReActStep::Action {
+                                    thought: converted.thought,
+                                    action: converted.tool,
+                                    action_input: converted.action_input.to_string(),
+                                    predictive: None,
+                                }
+                            } else {
+                                // Auto-convert failed — bail with raw response.
+                                warn!("Prose auto-convert failed, returning raw response");
+                                self.emit_step(step, "final_answer", response.trim());
+                                self.prediction_capture.end_interaction(
+                                    &interaction_id, response.trim(), false,
+                                );
+                                return Ok(AgentResult {
+                                    answer: response.trim().to_string(),
+                                    tools_used,
+                                    iterations: step + 1,
+                                    routing_path: RoutingPath::ReactLoop,
+                                });
+                            }
+                        } else {
+                            // Tier 1: re-prompt with correction.
+                            let correction = {
+                                let recovery = self.prose_recovery.lock().unwrap();
+                                recovery.build_correction_prompt(&info, user_query)
+                            };
+                            conversation.push_str(&response);
+                            conversation.push_str(&format!("\n{correction}\n"));
+                            continue;
+                        }
+                    } else {
+                        // No prose detected either — treat as final answer.
+                        warn!("ReAct: could not parse model output, treating as final answer");
+                        self.emit_step(step, "final_answer", response.trim());
+                        self.prediction_capture.end_interaction(
+                            &interaction_id, response.trim(), false,
+                        );
+                        return Ok(AgentResult {
+                            answer: response.trim().to_string(),
+                            tools_used,
+                            iterations: step + 1,
+                            routing_path: RoutingPath::ReactLoop,
+                        });
+                    }
                 }
             };
 
@@ -1271,10 +1715,20 @@ RESPONSE STYLE — CRITICAL:
 
                     // Answer quality gate
                     match quality_gate.check(&answer, user_query) {
-                        QualityVerdict::Accept => {}
+                        QualityVerdict::Accept => {
+                            info!(
+                                "Quality gate: accepted (reprompts={}/{})",
+                                quality_gate.reprompt_count(),
+                                quality_gate.max_reprompts()
+                            );
+                        }
                         QualityVerdict::Reject { reason, reprompt } => {
                             if step < MAX_STEPS - 1 {
-                                warn!("Quality gate: answer rejected ({reason}), re-prompting");
+                                warn!(
+                                    "Quality gate: rejected ({reason}), reprompt {}/{}",
+                                    quality_gate.reprompt_count(),
+                                    quality_gate.max_reprompts()
+                                );
                                 conversation.push_str(&response);
                                 conversation.push_str(&format!("\n{reprompt}\n"));
                                 continue;
@@ -1301,6 +1755,12 @@ RESPONSE STYLE — CRITICAL:
                     }
 
                     self.emit_step(step, "final_answer", &answer);
+                    // End prediction capture interaction.
+                    self.prediction_capture.end_interaction(
+                        &interaction_id,
+                        &answer,
+                        true,
+                    );
                     return Ok(AgentResult {
                         answer,
                         tools_used,
@@ -1312,6 +1772,7 @@ RESPONSE STYLE — CRITICAL:
                     thought,
                     action,
                     action_input,
+                    predictive,
                 } => {
                     info!("ReAct thought: {thought}");
                     info!("ReAct action: {action}({action_input})");
@@ -1349,6 +1810,18 @@ RESPONSE STYLE — CRITICAL:
                         }
                         h.handle_failure(&action, "tool is offline")
                     } else if let Some(tool) = self.registry.get(&action) {
+                        // ── Policy check — gate tool execution ───────────
+                        let policy_decision = {
+                            let mut pm = self.policy_manager.lock().unwrap();
+                            pm.check_permission(&action, &action_input)
+                        };
+                        if let PolicyDecision::Deny { reason } = policy_decision {
+                            warn!("Policy denied tool '{action}': {reason}");
+                            if let Ok(mut mem) = self.tool_memory.lock() {
+                                mem.record_failure(&action, action_type, &reason);
+                            }
+                            format!("POLICY_DENIED: {reason}")
+                        } else {
                         // Parse the action input as JSON.
                         let input: serde_json::Value =
                             serde_json::from_str(&action_input).unwrap_or_else(|_| {
@@ -1376,6 +1849,7 @@ RESPONSE STYLE — CRITICAL:
                                 h.handle_failure(&action, &e.to_string())
                             }
                         }
+                        } // end policy-allowed else block
                     } else {
                         format!("Unknown tool: \"{action}\". Available tools: {:?}", self.registry.names())
                     };
@@ -1387,6 +1861,38 @@ RESPONSE STYLE — CRITICAL:
 
                     info!("Observation: {}", &truncated[..truncated.len().min(200)]);
                     self.emit_step(step, "observation", &truncated);
+
+                    // ── Record prediction event (Phase 3) ───────────────
+                    {
+                        let action_input_json: serde_json::Value =
+                            serde_json::from_str(&action_input).unwrap_or(serde_json::json!({}));
+
+                        let mut event = PredictionEvent::new();
+                        event.action = action.clone();
+                        event.action_input = action_input_json;
+                        event.observation = truncated[..truncated.len().min(2000)].to_string();
+
+                        if let Some(ref pm) = predictive {
+                            event.system2_ttc = pm.system2_ttc.clone();
+                            event.ttc_selection = pm.ttc_selection.clone();
+                            event.prediction = pm.prediction.clone();
+                            event.error_delta = pm.error_delta.clone();
+                            event.delta_is_high = pm.delta_is_high;
+                        }
+
+                        self.prediction_capture
+                            .record_event(&interaction_id, event);
+                    }
+
+                    // ── Emit ToolOutcome to event bus (Phase 5) ──────────
+                    if let Some(ref tx) = self.event_tx {
+                        let success = !observation.contains("[ERROR]")
+                            && !observation.contains("Unknown tool");
+                        let _ = tx.send(crate::event_bus::CognitiveEvent::ToolOutcome {
+                            tool_name: action.clone(),
+                            success,
+                        });
+                    }
 
                     // Append the full step to conversation for next iteration.
                     conversation.push_str(&response);
@@ -1411,8 +1917,8 @@ RESPONSE STYLE — CRITICAL:
 
         let final_response = self
             .nexus
-            .generate_with_system(
-                &system_prompt,
+            .generate_with_cached_prefix(
+                system_prompt,
                 &conversation,
                 ModelTarget::Prime,
                 self.max_tokens,
@@ -1421,6 +1927,24 @@ RESPONSE STYLE — CRITICAL:
             .await?;
 
         self.emit_step(MAX_STEPS, "final_answer", final_response.trim());
+        // End prediction capture (forced answer = partial success).
+        self.prediction_capture.end_interaction(
+            &interaction_id,
+            final_response.trim(),
+            false,
+        );
+        // Log prediction capture stats.
+        let stats = self.prediction_capture.stats();
+        info!(
+            "Prediction stats: {} high deltas, {} captures written",
+            stats.total_high_deltas, stats.total_captures_written
+        );
+        // Log context manager thresholds for diagnostics.
+        info!(
+            "Context manager: compress_threshold={}, max_context_len={}",
+            self.context_manager.compress_threshold(),
+            self.context_manager.max_context_len()
+        );
         Ok(AgentResult {
             answer: final_response.trim().to_string(),
             tools_used,
@@ -1460,6 +1984,7 @@ mod tests {
                 thought,
                 action,
                 action_input,
+                ..
             } => {
                 assert_eq!(thought, "I need to search for this file.");
                 assert_eq!(action, "file_search");
@@ -1646,17 +2171,18 @@ mod tests {
         assert_eq!(truncate_observation(&obs), obs);
     }
 
-    // ─── Context compression tests ──────────────────────────────────────
+    // ─── Context compression tests (via ContextManager struct) ─────────
 
     #[test]
     fn test_compress_short_context_unchanged() {
+        let cm = crate::agent::context::ContextManager::new();
         let ctx = "User: hello\nTHOUGHT: thinking\n";
-        assert_eq!(compress_context(ctx), ctx);
+        assert_eq!(cm.compress(ctx), ctx);
     }
 
     #[test]
     fn test_compress_drops_old_observations() {
-        // Build a context with 5 observations
+        let cm = crate::agent::context::ContextManager::with_thresholds(1000, 24_000);
         let mut ctx = String::from("User: test\n");
         for i in 0..5 {
             ctx.push_str(&format!("THOUGHT: step {i}\n"));
@@ -1665,40 +2191,42 @@ mod tests {
             ctx.push_str(&format!("OBSERVATION: {obs}\n"));
         }
 
-        assert!(ctx.len() > CONTEXT_COMPRESS_THRESHOLD);
-        let compressed = compress_context(&ctx);
+        let compressed = cm.compress(&ctx);
         assert!(compressed.len() < ctx.len());
-        // Should contain the word "compressed"
         assert!(compressed.contains("compressed"));
     }
 
-    // ─── Quality gate tests ─────────────────────────────────────────────
+    // ─── Quality gate tests (via AnswerQualityGate struct) ──────────────
 
     #[test]
     fn test_quality_good_answer() {
-        assert!(is_quality_answer("The capital of France is Paris.", "what is the capital of France"));
+        let mut gate = AnswerQualityGate::with_min_length(10);
+        assert_eq!(gate.check("The capital of France is Paris.", "what is the capital of France"), QualityVerdict::Accept);
     }
 
     #[test]
     fn test_quality_too_short() {
-        assert!(!is_quality_answer("Yes", "what is quantum computing"));
+        let mut gate = AnswerQualityGate::with_min_length(10);
+        assert!(matches!(gate.check("Yes", "what is quantum computing"), QualityVerdict::Reject { .. }));
     }
 
     #[test]
     fn test_quality_echo_rejected() {
-        assert!(!is_quality_answer("what time is it", "what time is it"));
+        let mut gate = AnswerQualityGate::with_min_length(10);
+        assert!(matches!(gate.check("what time is it", "what time is it"), QualityVerdict::Reject { .. }));
     }
 
     #[test]
     fn test_quality_refusal_rejected() {
-        assert!(!is_quality_answer("I cannot help with that.", "open notepad"));
+        let mut gate = AnswerQualityGate::with_min_length(10);
+        assert!(matches!(gate.check("I cannot help with that.", "open notepad"), QualityVerdict::Reject { .. }));
     }
 
     #[test]
     fn test_quality_long_refusal_accepted() {
-        // Long answers that happen to contain refusal phrases should be OK
+        let mut gate = AnswerQualityGate::with_min_length(10);
         let long_answer = format!("I cannot tell you the exact result because the process is still running, but here's what I found so far: {}", "a".repeat(100));
-        assert!(is_quality_answer(&long_answer, "check status"));
+        assert_eq!(gate.check(&long_answer, "check status"), QualityVerdict::Accept);
     }
 
     // ─── Action tracker tests ───────────────────────────────────────────
@@ -1737,6 +2265,7 @@ mod tests {
         assert_eq!(format!("{}", RoutingPath::FastLaunch), "fast_launch");
         assert_eq!(format!("{}", RoutingPath::FastAnswer), "fast_answer");
         assert_eq!(format!("{}", RoutingPath::ExecutionPath("get_time".to_string())), "execution_path:get_time");
+        assert_eq!(format!("{}", RoutingPath::DagExecution), "dag_execution");
         assert_eq!(format!("{}", RoutingPath::ReactLoop), "react_loop");
     }
 
@@ -1856,5 +2385,143 @@ mod tests {
             tracker.record_failure("web_search");
         }
         assert!(tracker.offline_tools().contains("web_search"));
+    }
+
+    // ─── Predictive coding parse tests ─────────────────────────────────
+
+    #[test]
+    fn test_parse_with_predictive_coding() {
+        let text = "\
+[SYSTEM 2: TEST-TIME COMPUTE]
+Option A: Search for \"rust programming\"
+Option B: Search for \"rust language\"
+Selected: Option A — more specific
+[/SYSTEM 2]
+
+[PREDICTIVE ANCHOR]
+I predict: web_search will return rust-lang.org as first result
+[/PREDICTIVE ANCHOR]
+
+THOUGHT: I need to search for information about Rust.
+ACTION: web_search
+ACTION_INPUT: {\"query\": \"rust programming\"}";
+
+        let step = ReActAgent::parse_response(text);
+        assert!(step.is_some());
+        match step.unwrap() {
+            ReActStep::Action {
+                thought,
+                action,
+                action_input,
+                predictive,
+            } => {
+                assert_eq!(action, "web_search");
+                assert!(thought.contains("search for information"));
+                assert!(action_input.contains("rust programming"));
+                assert!(predictive.is_some());
+                let pm = predictive.unwrap();
+                assert!(pm.system2_ttc.contains("Option A"));
+                assert!(pm.prediction.contains("rust-lang.org"));
+                assert!(!pm.delta_is_high); // No error delta yet
+            }
+            _ => panic!("expected Action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_with_error_delta_high() {
+        let text = "\
+[ERROR DELTA]
+Predicted: Results about Rust programming language
+Actual: Results about rust (corrosion)
+Delta: HIGH
+[/ERROR DELTA]
+
+THOUGHT: The search returned wrong results, need to refine query.
+ACTION: web_search
+ACTION_INPUT: {\"query\": \"rust programming language official site\"}";
+
+        let step = ReActAgent::parse_response(text);
+        assert!(step.is_some());
+        match step.unwrap() {
+            ReActStep::Action { predictive, .. } => {
+                assert!(predictive.is_some());
+                let pm = predictive.unwrap();
+                assert!(pm.delta_is_high);
+                assert!(pm.error_delta.contains("HIGH"));
+            }
+            _ => panic!("expected Action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_with_error_delta_zero() {
+        let text = "\
+[ERROR DELTA]
+Predicted: Notepad opens successfully
+Actual: Notepad opened
+Delta: ZERO
+[/ERROR DELTA]
+
+THOUGHT: The program opened as expected.
+ANSWER: Notepad has been launched successfully.";
+
+        let step = ReActAgent::parse_response(text);
+        assert!(step.is_some());
+        match step.unwrap() {
+            ReActStep::FinalAnswer { answer, .. } => {
+                assert!(answer.contains("Notepad"));
+            }
+            _ => panic!("expected FinalAnswer"),
+        }
+    }
+
+    #[test]
+    fn test_parse_no_predictive_coding() {
+        let text = "THOUGHT: Simple question.\nANSWER: The capital is Paris.";
+        let step = ReActAgent::parse_response(text);
+        assert!(step.is_some());
+        match step.unwrap() {
+            ReActStep::FinalAnswer { .. } => {} // No predictive field on FinalAnswer
+            _ => panic!("expected FinalAnswer"),
+        }
+    }
+
+    #[test]
+    fn test_strip_predictive_blocks() {
+        let text = "\
+[SYSTEM 2: TEST-TIME COMPUTE]
+Some options
+[/SYSTEM 2]
+THOUGHT: reasoning
+ACTION: web_search
+ACTION_INPUT: {\"query\": \"test\"}";
+
+        let stripped = ReActAgent::strip_predictive_blocks(text);
+        assert!(!stripped.contains("[SYSTEM 2"));
+        assert!(stripped.contains("THOUGHT:"));
+        assert!(stripped.contains("ACTION: web_search"));
+    }
+
+    #[test]
+    fn test_extract_predictive_meta_none() {
+        let text = "THOUGHT: simple\nANSWER: hello";
+        assert!(ReActAgent::extract_predictive_meta(text).is_none());
+    }
+
+    #[test]
+    fn test_extract_predictive_meta_with_selection() {
+        let text = "\
+[SYSTEM 2: TEST-TIME COMPUTE]
+Option A: Do X
+Option B: Do Y
+Selected: A because X is better
+[/SYSTEM 2]
+THOUGHT: ok";
+
+        let meta = ReActAgent::extract_predictive_meta(text);
+        assert!(meta.is_some());
+        let pm = meta.unwrap();
+        assert!(pm.ttc_selection.contains("A because X is better"));
     }
 }

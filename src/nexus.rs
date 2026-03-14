@@ -52,8 +52,8 @@ pub enum ModelTarget {
 // ModelNexus
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Manages the full model fleet: Prime (14B GPU), Worker (0.5B CPU),
-/// Subconscious (3B CPU), and Warden (3B CPU).
+/// Manages the full model fleet: Prime (14B GPU), Worker (0.5B GPU draft),
+/// Subconscious (3B CPU, isolated process), and Warden (3B CPU, isolated process).
 pub struct ModelNexus {
     backend: Arc<LlamaBackend>,
     prime: Option<Arc<RwLock<ModelSlot>>>,
@@ -61,6 +61,10 @@ pub struct ModelNexus {
     subconscious: Option<Arc<RwLock<ModelSlot>>>,
     warden: Option<Arc<RwLock<ModelSlot>>>,
     config: TitanConfig,
+    /// Number of tokens in the warmed-up system prefix (Prime model).
+    /// When set, `generate_with_cached_prefix` preserves this many KV
+    /// entries instead of clearing the full cache.
+    prefix_token_count: Option<usize>,
 }
 
 impl ModelNexus {
@@ -74,6 +78,7 @@ impl ModelNexus {
             subconscious: None,
             warden: None,
             config,
+            prefix_token_count: None,
         })
     }
 
@@ -174,7 +179,7 @@ impl ModelNexus {
         Ok(())
     }
 
-    /// Load the 0.5B Worker model (CPU-only, speculative decoding).
+    /// Load the 0.5B Worker model (GPU, speculative decoding draft for Prime).
     pub fn load_worker_model(&mut self) -> Result<()> {
         let slot = Self::load_slot(
             &self.backend,
@@ -233,6 +238,72 @@ impl ModelNexus {
         }
 
         Ok(())
+    }
+
+    // ── KV Cache Warmup ────────────────────────────────────────────────
+
+    /// Warm up the KV cache for the Prime model with the static system prefix.
+    ///
+    /// Tokenizes the `UNIVERSAL_BASE_PREFIX` (wrapped in ChatML system tags),
+    /// evaluates all prefix tokens through the transformer to populate the KV
+    /// cache, then records the token count. Subsequent calls to
+    /// [`generate_with_cached_prefix`] will preserve these KV entries and only
+    /// clear/re-evaluate the dynamic user turn.
+    ///
+    /// This eliminates the ~3,000-token re-evaluation penalty on every request.
+    pub fn warmup_cache(&mut self, system_prefix: &str) -> Result<()> {
+        let slot = self.prime.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Prime model not loaded — cannot warmup cache"))?
+            .clone();
+
+        let prefix_chatml = format!(
+            "<|im_start|>system\n{system_prefix}<|im_end|>\n"
+        );
+
+        let prefix_str = prefix_chatml.clone();
+        let n_tokens = {
+            let mut guard = slot.blocking_write();
+            let ModelSlot { ref mut ctx, ref model } = *guard;
+
+            // Clear any existing KV state.
+            ctx.clear_kv_cache();
+
+            // Tokenize the static prefix.
+            let tokens = model
+                .str_to_token(&prefix_str, AddBos::Never)
+                .map_err(|e| anyhow::anyhow!("warmup tokenization failed: {e:?}"))?;
+
+            anyhow::ensure!(!tokens.is_empty(), "warmup produced 0 tokens");
+
+            let n = tokens.len();
+            info!(
+                "Warmup: evaluating {} prefix tokens ({} chars) into KV cache",
+                n, prefix_str.len()
+            );
+
+            // Feed prefix tokens into the context to populate the KV cache.
+            let mut batch = LlamaBatch::new(n, 1);
+            for (i, &tok) in tokens.iter().enumerate() {
+                let is_last = i == n - 1;
+                batch
+                    .add(tok, i as i32, &[0], is_last)
+                    .map_err(|e| anyhow::anyhow!("warmup batch add failed: {e:?}"))?;
+            }
+
+            ctx.decode(&mut batch)
+                .map_err(|e| anyhow::anyhow!("warmup decode failed: {e:?}"))?;
+
+            info!("Warmup complete: {} prefix tokens locked in KV cache", n);
+            n
+        };
+
+        self.prefix_token_count = Some(n_tokens);
+        Ok(())
+    }
+
+    /// Get the number of prefix tokens locked in the KV cache.
+    pub fn prefix_token_count(&self) -> Option<usize> {
+        self.prefix_token_count
     }
 
     // ── Generation ───────────────────────────────────────────────────────
@@ -462,6 +533,178 @@ impl ModelNexus {
             &result,
         );
         Ok(result)
+    }
+
+    /// Generate text with the KV-cached system prefix preserved.
+    ///
+    /// Instead of clearing the entire KV cache and re-evaluating the full
+    /// ChatML prompt (system + user), this method:
+    /// 1. Keeps the prefix tokens (evaluated during `warmup_cache()`) in the KV cache
+    /// 2. Clears only the KV entries after the prefix
+    /// 3. Tokenizes and evaluates only the dynamic user turn
+    /// 4. Generates output tokens
+    ///
+    /// This saves ~3,000 tokens of re-evaluation on every request.
+    ///
+    /// Falls back to `generate_with_system` if the KV cache hasn't been
+    /// warmed up (i.e., `prefix_token_count` is None).
+    pub async fn generate_with_cached_prefix(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        target: ModelTarget,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> Result<String> {
+        // Fall back if no prefix is cached.
+        let prefix_len = match self.prefix_token_count {
+            Some(n) => n,
+            None => {
+                info!("[cached_prefix] No prefix cached, falling back to full generation");
+                return self
+                    .generate_with_system(system_prompt, user_message, target, max_tokens, temperature)
+                    .await;
+            }
+        };
+
+        let stop_sequences: Vec<String> = vec![
+            "\nOBSERVATION:".to_string(),
+            "\nOBSERVATION".to_string(),
+        ];
+
+        // Only the user turn needs to be tokenized and evaluated fresh.
+        // The system prefix is already in the KV cache from warmup.
+        let user_turn = format!(
+            "<|im_start|>user\n{user_message}<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+
+        info!(
+            "[cached_prefix] prefix={} tokens (cached), user_turn={} chars, temp={}, max_tokens={}",
+            prefix_len, user_turn.len(), temperature, max_tokens,
+        );
+
+        let slot = self.slot_for(target)?;
+        let stops = stop_sequences;
+
+        tokio::task::spawn_blocking(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut guard = slot.blocking_write();
+                let ModelSlot { ref mut ctx, ref model } = *guard;
+
+                // Clear only KV entries AFTER the prefix.
+                // This preserves the warmed-up system prompt tokens.
+                let _ = ctx.clear_kv_cache_seq(
+                    Some(0),                     // seq_id 0
+                    Some(prefix_len as u32),      // from prefix_len
+                    None,                         // to end
+                );
+
+                // Tokenize only the dynamic user turn.
+                let user_tokens = model
+                    .str_to_token(&user_turn, AddBos::Never)
+                    .map_err(|e| anyhow::anyhow!("user turn tokenization failed: {e:?}"))?;
+
+                if user_tokens.is_empty() {
+                    anyhow::bail!("user turn tokenization produced 0 tokens");
+                }
+
+                info!(
+                    "[cached_prefix] user turn: {} tokens (prefix already cached: {} tokens)",
+                    user_tokens.len(), prefix_len,
+                );
+
+                // Feed user tokens starting at position prefix_len.
+                let mut batch = LlamaBatch::new(user_tokens.len(), 1);
+                for (i, &tok) in user_tokens.iter().enumerate() {
+                    let pos = (prefix_len + i) as i32;
+                    let is_last = i == user_tokens.len() - 1;
+                    batch
+                        .add(tok, pos, &[0], is_last)
+                        .map_err(|e| anyhow::anyhow!("user batch add failed: {e:?}"))?;
+                }
+
+                ctx.decode(&mut batch)
+                    .map_err(|e| anyhow::anyhow!("user turn decode failed: {e:?}"))?;
+
+                // Build sampler chain.
+                let seed: u32 = rand::random();
+                let mut sampler = if temperature <= 0.0 {
+                    LlamaSampler::greedy()
+                } else {
+                    LlamaSampler::chain(
+                        [
+                            LlamaSampler::penalties(64, 1.2, 0.0, 0.0),
+                            LlamaSampler::top_k(40),
+                            LlamaSampler::top_p(0.9, 1),
+                            LlamaSampler::min_p(0.05, 1),
+                            LlamaSampler::temp(temperature),
+                            LlamaSampler::dist(seed),
+                        ],
+                        false,
+                    )
+                };
+
+                // Autoregressive generation with stop sequence detection.
+                let eos = model.token_eos();
+                let mut n_decoded = (prefix_len + user_tokens.len()) as i32;
+                let mut decoder = encoding_rs::UTF_8.new_decoder();
+                let mut output = String::new();
+                let mut stopped = false;
+
+                for _ in 0..max_tokens {
+                    let new_token = sampler.sample(ctx, -1);
+                    sampler.accept(new_token);
+
+                    if new_token == eos {
+                        break;
+                    }
+
+                    let piece = model
+                        .token_to_piece(new_token, &mut decoder, false, None)
+                        .unwrap_or_default();
+                    output.push_str(&piece);
+
+                    // Check stop sequences.
+                    for stop in &stops {
+                        if output.ends_with(stop.as_str()) {
+                            let trimmed_len = output.len() - stop.len();
+                            output.truncate(trimmed_len);
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    if stopped {
+                        break;
+                    }
+
+                    let mut next_batch = LlamaBatch::new(1, 1);
+                    next_batch
+                        .add(new_token, n_decoded, &[0], true)
+                        .map_err(|e| anyhow::anyhow!("next batch failed: {e:?}"))?;
+                    ctx.decode(&mut next_batch)
+                        .map_err(|e| anyhow::anyhow!("decode step failed: {e:?}"))?;
+                    n_decoded += 1;
+                }
+
+                Ok(output)
+            }));
+
+            match result {
+                Ok(inner) => inner,
+                Err(panic_info) => {
+                    let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else {
+                        "unknown panic in llama-cpp inference".to_string()
+                    };
+                    Err(anyhow::anyhow!("Inference panic caught: {msg}"))
+                }
+            }
+        })
+        .await?
     }
 
     /// Generate a text completion with optional stop sequences.
